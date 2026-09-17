@@ -25,6 +25,7 @@ if __name__ == "__main__" and __spec__ is not None:
 
 _READ_ONLY_TOOLS = {
     "cosmos_search",
+    "material_roles",
     "get_bridge_status",
     "get_plugin_capabilities",
     "lighting_capabilities",
@@ -97,6 +98,7 @@ _DESTRUCTIVE_TOOLS = {
 
 _IDEMPOTENT_TOOLS = {
     "cosmos_search",
+    "material_roles",
     "cosmos_download",
     "get_bridge_status",
     "get_plugin_capabilities",
@@ -233,6 +235,7 @@ CORE_TOOL_MODULES = (
     "materials",
     "material_ops",
     "material_network",
+    "material_roles",
     "palette_laydown",
     "smart_import",
     "cosmos",
