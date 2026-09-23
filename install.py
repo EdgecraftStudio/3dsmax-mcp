@@ -437,10 +437,13 @@ def mcp_server_entry(repo_dir: str) -> dict:
     return entry
 
 
-def agent_registration_command(agent: str, server_command: list[str]) -> list[str] | None:
+def agent_registration_command(agent: str, server_command: list[str],
+                               env: dict[str, str] | None = None) -> list[str] | None:
     """Build one agent CLI registration command around the shared server launch."""
     if agent == "claude":
-        return [agent, "mcp", "add", "--scope", "user", "3dsmax-mcp", "--", *server_command]
+        # -e is variadic, so it must follow the server name.
+        env_args = [arg for key, value in (env or {}).items() for arg in ("-e", f"{key}={value}")]
+        return [agent, "mcp", "add", "--scope", "user", "3dsmax-mcp", *env_args, "--", *server_command]
     if agent == "codex":
         return [agent, "mcp", "add", "3dsmax-mcp", "--", *server_command]
     if agent == "gemini":
@@ -556,6 +559,37 @@ def register_opencode(repo_dir: str) -> bool:
             Path(temporary).unlink(missing_ok=True)
 
 
+def run_agent_command(command: list[str]) -> str | None:
+    """Run an agent CLI command; return its output on failure, None on success."""
+    try:
+        # Agent CLIs installed through npm are commonly .cmd shims on
+        # Windows, so keep shell execution while quoting the argv once.
+        subprocess.run(subprocess.list2cmdline(command), shell=True, check=True,
+                       capture_output=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        return "timed out"
+    except subprocess.CalledProcessError as exc:
+        parts = [p.decode("utf-8", "replace") if isinstance(p, bytes) else p
+                 for p in (exc.stderr, exc.stdout) if p]
+        return "\n".join(parts).strip() or f"exit code {exc.returncode}"
+    return None
+
+
+def _first_line(text: str) -> str:
+    return next((line.strip() for line in text.splitlines() if line.strip()), text)
+
+
+def claude_user_env() -> dict[str, str]:
+    """Return the env of the existing Claude Code user entry, or {} if unreadable."""
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    path = (Path(base) if base else Path.home()) / ".claude.json"
+    try:
+        env = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["3dsmax-mcp"].get("env")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {}
+    return {str(k): str(v) for k, v in env.items()} if isinstance(env, dict) else {}
+
+
 def register_agents() -> bool:
     print("\n[4/4] Agent registration")
     dir_str = str(ROOT)
@@ -579,13 +613,24 @@ def register_agents() -> bool:
             continue
         display = subprocess.list2cmdline(cmd)
         print(f"  Registering with {agent}...")
-        try:
-            # Agent CLIs installed through npm are commonly .cmd shims on
-            # Windows, so keep shell execution while quoting the argv once.
-            subprocess.run(display, shell=True, check=True, capture_output=True, timeout=15)
+        error = run_agent_command(cmd)
+        if error and agent == "claude" and "already exists" in error:
+            # `claude mcp add` never overwrites, so an existing entry would keep its
+            # old launch command. Replace it, keeping env such as MCP_TOOL_PROFILE.
+            env = claude_user_env()
+            error = run_agent_command([agent, "mcp", "remove", "3dsmax-mcp", "--scope", "user"])
+            if not error:
+                cmd = agent_registration_command(agent, server_command, env)
+                display = subprocess.list2cmdline(cmd)
+                error = run_agent_command(cmd)
+                if error:
+                    print(f"  FAILED: {agent} entry was removed but not re-added "
+                          f"({_first_line(error)}); run manually: {display}")
+                    continue
+        if error:
+            print(f"  SKIP: {agent} ({_first_line(error)}; run manually: {display})")
+        else:
             print(f"  OK: {agent}")
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            print(f"  SKIP: {agent} (run manually: {display})")
 
     if not IS_PACKAGED:
         warn_if_uv_missing()
