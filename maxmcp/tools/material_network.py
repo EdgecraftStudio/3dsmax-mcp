@@ -78,6 +78,7 @@ def _compact_inspect_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "issues": payload.get("issues", []),
         "warnings": payload.get("warnings", []),
         "truncated": payload.get("truncated"),
+        "complete": payload.get("complete"),
     }
     manifest = payload.get("fileManifest")
     if isinstance(manifest, list):
@@ -105,7 +106,7 @@ def _compact_inspect_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def inspect_material_network(
     name: str,
     sub_material_index: int = 0,
-    depth: int = 3,
+    depth: int = 6,
     scope: str = "wired",
     include_values: bool = True,
     verify_files: bool = True,
@@ -113,7 +114,12 @@ def inspect_material_network(
     profile: str = "auto",
     compact: bool = False,
 ) -> str:
-    """Inspect a material graph: wired slots, nested maps, file manifest, and health issues."""
+    """Inspect a material graph: wired slots, nested maps, file manifest, and health issues.
+
+    complete=false means part of the graph was not read, and hints.replicateReady is
+    then false. truncated.depthLimited lists nodes with unread inputs: call again with
+    a higher depth (up to 16). nodesOmitted/edgesOmitted need a higher max_nodes.
+    """
     if not client.native_available:
         return _native_unavailable("inspect_material_network")
 
@@ -124,7 +130,7 @@ def inspect_material_network(
     payload = {
         "name": name,
         "sub_material_index": max(0, int(sub_material_index)),
-        "depth": min(6, max(0, int(depth))),
+        "depth": min(16, max(0, int(depth))),
         "scope": normalized_scope,
         "include_values": bool(include_values),
         "verify_files": bool(verify_files),

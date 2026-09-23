@@ -1269,7 +1269,7 @@ std::string NativeHandlers::InspectMaterialNetwork(const std::string& params, MC
 
         std::string name = p.value("name", "");
         int subIdx = p.value("sub_material_index", 0);
-        int depth = p.value("depth", 3);
+        int depth = p.value("depth", 6);
         std::string scope = p.value("scope", "wired");
         bool includeValues = p.value("include_values", true);
         bool verifyFiles = p.value("verify_files", true);
