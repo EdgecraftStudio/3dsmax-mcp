@@ -106,6 +106,7 @@ Debugging:
 - Share an existing material: `assign_material(names=[...], source_name="ExistingObject")` (or `source_handle`). Shares the full material/maps in one undo step; omit creation arguments.
 - Edit: `set_material_property`, `set_material_properties`
 - Inspect: `get_material_slots`, `get_materials`, `get_material_library`
+- `material_roles` — read each slot's file sources through wrappers and submaterials. Use unique object/material `names`, or `scan_scene=true` for assigned materials. Follow `next_offset`; check `complete` and `truncated` before treating an audit as exhaustive. `only_problems=true` retains incomplete reads and warnings. Filename mismatches are advisory: inspect channels, map transforms and renderer modes before editing.
 - Scratch libraries: `backup_material_library` saves `currentMaterialLibrary` / `meditMaterials` to `.mat`
 - Multi/Sub: `set_sub_material`
 - Textures: `create_texture_map`, `set_texture_map_properties`

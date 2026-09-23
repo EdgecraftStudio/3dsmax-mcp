@@ -76,6 +76,7 @@ TOOLSET_SPECS = (
             "materials",
             "material_ops",
             "material_network",
+            "material_roles",
             "palette_laydown",
             "smart_import",
             "material_replace",

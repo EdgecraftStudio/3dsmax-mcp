@@ -1,8 +1,5 @@
-"""Which file plays which role in a material, resolved from the wiring."""
-
+"""Resolve material texture sources from the complete connection graph."""
 from __future__ import annotations
-
-from typing import Any
 
 from ..server import mcp, client
 from ..helpers import material_roles as impl
@@ -10,50 +7,46 @@ from ..helpers import material_roles as impl
 
 @mcp.tool()
 def material_roles(names: list[str] | None = None, scan_scene: bool = False,
-                   limit: int = 25, only_problems: bool = False) -> dict:
-    """Resolve each material's maps to roles from the wiring, not from file names.
+                   limit: int = 25, only_problems: bool = False, offset: int = 0,
+                   depth: int = 8, max_nodes: int = 400) -> dict:
+    """Read the files connected to each material slot, including wrappers and submaterials.
 
-    Use when: you need to know what a material actually does — which file is the
-    base colour, the roughness, the normal — before editing, converting or
-    rebuilding it, or to audit a scene for maps wired into the wrong slot and for
-    missing texture files.
-    Not when: you want the full node graph with parameters — use
-    inspect_material_network.
-    Walks through wrapper nodes (colour correct, CoronaNormal, mixes) down to the
-    bitmap, so the answer is one row per role with its file. File names are used
-    only as a hint and a disagreement is reported, never used to decide the role.
-    scan_scene reads the scene's own material list; only_problems returns just
-    the materials with a mismatch or a missing file.
+    Supply unique object/material names OR scan_scene=true for assigned scene
+    materials. Distinct slots, shared maps, composite inputs and file tiles stay
+    separate. Each row carries the submaterial and source path; procedural maps
+    can have no file. The operation is read-only.
+
+    Filename mismatches are advisory: inspect channel selection, conversions and
+    renderer modes before changing anything. Mask inputs are identified separately.
+    only_problems retains missing files, mismatches, warnings and incomplete reads.
+    Follow next_offset for more results; pages are stable while the scene is unchanged.
+    complete=false means there are unread pages, failed targets or a truncated graph.
+    Increase depth/max_nodes for truncated graphs. Use inspect_material_network for
+    parameter values. Requires a native bridge supporting graphVersion 2 connections.
     """
-    if scan_scene:
-        wanted = impl.scene_material_names(client, limit=max(1, min(int(limit), 200)))
-    else:
-        wanted = [n for n in (names or []) if str(n).strip()]
-    if not wanted:
-        raise ValueError("Supply names=[...] or scan_scene=true.")
-    wanted = wanted[:max(1, min(int(limit), 200))]
-
-    results: list[dict[str, Any]] = []
-    failed: list[dict[str, str]] = []
-    for name in wanted:
-        try:
-            payload = impl.fetch_network(client, str(name))
-        except Exception as exc:  # a broken material must not kill the whole scan
-            failed.append({"material": str(name), "error": str(exc)})
-            continue
-        if not payload.get("ok", True):
-            failed.append({"material": str(name), "error": str(payload.get("error") or "inspect failed")})
-            continue
-        resolved = impl.roles_from_payload(payload)
-        if only_problems and not resolved["mismatches"] and not resolved["missing_files"]:
-            continue
-        results.append(resolved)
-
+    if not isinstance(scan_scene, bool) or not isinstance(only_problems, bool):
+        raise ValueError("scan_scene and only_problems must be booleans")
+    for key, value, low, high in (("limit", limit, 1, 200), ("offset", offset, 0, 2147483647),
+                                   ("depth", depth, 1, 16), ("max_nodes", max_nodes, 1, 2000)):
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            raise ValueError(f"{key} must be an integer from {low} to {high}")
+    if names is not None and (not isinstance(names, list) or len(names) > 200 or
+                             any(not isinstance(n, str) or not n.strip() for n in names)):
+        raise ValueError("names must be a list of up to 200 nonempty object/material names")
+    if scan_scene == bool(names):
+        raise ValueError("Supply names=[...] or scan_scene=true, exclusively")
+    # Preserve significant whitespace in Max names; repeat targets only once.
+    wanted = list(dict.fromkeys(names or []))
+    batch = impl.fetch_graphs(client, names=wanted, scan_scene=scan_scene, limit=limit,
+                             offset=offset, depth=depth, max_nodes=max_nodes)
+    audited = [impl.roles_from_payload(graph) for graph in batch["graphs"]]
+    results = [r for r in audited if not only_problems or r["mismatches"] or r["missing_files"]
+               or r["issues"] or r["warnings"] or not r["complete"]]
     return {
-        "materials": results,
-        "checked": len(wanted),
-        "returned": len(results),
-        "with_mismatch": sum(1 for r in results if r["mismatches"]),
-        "with_missing_files": sum(1 for r in results if r["missing_files"]),
-        "failed": failed,
+        "materials": results, "checked": batch["checked"], "returned": len(results),
+        "total": batch["total"], "offset": batch["offset"], "next_offset": batch["next_offset"],
+        "complete": batch["next_offset"] is None and not batch["failed"] and all(r["complete"] for r in audited),
+        "with_mismatch": sum(bool(r["mismatches"]) for r in audited),
+        "with_missing_files": sum(bool(r["missing_files"]) for r in audited),
+        "failed": batch["failed"],
     }

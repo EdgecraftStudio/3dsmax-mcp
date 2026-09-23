@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "tool_count": 174,
+  "tool_count": 176,
   "starter_tools": [
     "query_scene",
     "get_session_context",
@@ -55,11 +55,12 @@
     {
       "name": "Objects",
       "hint": "Create, transform, modifiers, layers",
-      "tool_count": 25,
+      "tool_count": 26,
       "categories": [
         {
           "name": "Modeling",
           "tools": [
+            "contact_check",
             "curve_model",
             "edit_curve",
             "inspect_curve"
@@ -107,7 +108,7 @@
     {
       "name": "Materials",
       "hint": "Assign, textures, palette laydown, smart import",
-      "tool_count": 22,
+      "tool_count": 23,
       "categories": [
         {
           "name": "Cosmos",
@@ -121,6 +122,7 @@
           "name": "Material Network",
           "tools": [
             "inspect_material_network",
+            "material_roles",
             "replicate_material"
           ]
         },
@@ -1726,6 +1728,46 @@
       "starter": false
     },
     {
+      "name": "material_roles",
+      "description": "Read the files connected to each material slot, including wrappers and submaterials.",
+      "category": "Material Network",
+      "group": "Materials",
+      "module": "material_roles",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "scan_scene": {
+            "type": "boolean"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "only_problems": {
+            "type": "boolean"
+          },
+          "offset": {
+            "type": "integer"
+          },
+          "depth": {
+            "type": "integer"
+          },
+          "max_nodes": {
+            "type": "integer"
+          }
+        }
+      },
+      "example": {},
+      "risk": "read",
+      "routing": "python",
+      "starter": false
+    },
+    {
       "name": "replicate_material",
       "description": "Preview or apply a structure-preserving material clone/remap through native C++.",
       "category": "Material Network",
@@ -2413,6 +2455,52 @@
         "folder": ""
       },
       "risk": "changes_scene",
+      "routing": "maxscript",
+      "starter": false
+    },
+    {
+      "name": "contact_check",
+      "description": "Find meshes that pass through each other, touch, or float just short of contact.",
+      "category": "Modeling",
+      "group": "Objects",
+      "module": "contact_check",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "against": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "tolerance": {
+            "type": "number"
+          },
+          "near_gap": {
+            "type": "number"
+          },
+          "include_separate": {
+            "type": "boolean"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "max_pairs": {
+            "type": "integer"
+          },
+          "max_faces": {
+            "type": "integer"
+          }
+        }
+      },
+      "example": {},
+      "risk": "read",
       "routing": "maxscript",
       "starter": false
     },

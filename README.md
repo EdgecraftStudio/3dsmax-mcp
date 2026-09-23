@@ -184,6 +184,7 @@ Automate repetitive work with MAXScript, or build procedural geometry and modifi
 | `backup_material_library` | Save temporary/scratch material libraries to `.mat` files |
 | `get_material_slots` | Compact slot/property readback for a material |
 | `inspect_material_network` | Semantic material graph, wired slots, texture manifest, health checks |
+| `material_roles` | Texture sources per material slot, including shared maps, composites and submaterials; advisory filename mismatches and missing files |
 | `replicate_material` | Preview/apply structure-preserving material clone and texture remap |
 | `assign_material` | Create a material and assign it to objects |
 | `set_material_property` | Set one property on an object's material |

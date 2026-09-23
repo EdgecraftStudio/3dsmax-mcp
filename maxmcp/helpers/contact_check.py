@@ -109,11 +109,16 @@ def _point(text: str) -> list[float] | None:
     parts = text.split(",")
     if len(parts) != 3:
         raise ValueError("bad point")
-    return [float(p) for p in parts]
+    point = [float(p) for p in parts]
+    if not all(math.isfinite(v) for v in point):
+        raise ValueError("non-finite point")
+    return point
 
 
 def _measure(text: str) -> float | None:
     value = float(text)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("invalid distance")
     return None if value >= _BIG else value
 
 
@@ -126,16 +131,25 @@ def parse_report(raw: str, *, include_separate: bool = False, limit: int = 100) 
         raise RuntimeError("Contact check returned no report")
     try:
         head = lines[0].split("|")
+        if len(head) != 7 or lines[-1] != "END" or lines.count("END") != 1:
+            raise ValueError("report truncated or malformed")
         tol, near = float(head[1]), float(head[2])
+        if not math.isfinite(tol) or not math.isfinite(near) or tol <= 0 or near < tol:
+            raise ValueError("invalid thresholds")
         units, node_count, candidates, elapsed = head[3], int(head[4]), int(head[5]), int(head[6])
         nodes: dict[int, dict[str, Any]] = {}
         pairs: list[dict[str, Any]] = []
         complete = False
+        seen_pairs: set[tuple[int, int]] = set()
         for line in lines[1:]:
             parts = line.split("|")
             tag = parts[0]
             if tag == "N":
+                if len(parts) != 5 or parts[4] not in {"0", "1"} or int(parts[3]) <= 0:
+                    raise ValueError("invalid mesh record")
                 handle = int(parts[1])
+                if handle <= 0 or handle in nodes:
+                    raise ValueError("invalid or repeated node")
                 nodes[handle] = {
                     "name": base64.b64decode(parts[2], validate=True).decode("utf-8"),
                     "handle": handle,
@@ -143,9 +157,17 @@ def parse_report(raw: str, *, include_separate: bool = False, limit: int = 100) 
                     "closed": parts[4] == "1",
                 }
             elif tag == "P":
+                if len(parts) != 12:
+                    raise ValueError("invalid pair record")
                 ha, hb = int(parts[1]), int(parts[2])
+                pair_key = tuple(sorted((ha, hb)))
+                if ha == hb or pair_key in seen_pairs:
+                    raise ValueError("invalid or repeated pair")
+                seen_pairs.add(pair_key)
                 depth = float(parts[3])
                 gap = _measure(parts[4])
+                if not math.isfinite(depth) or depth < 0 or any(int(p) < 0 for p in parts[5:9]):
+                    raise ValueError("invalid measurement")
                 inside = int(parts[5]) + int(parts[6])
                 crossings = int(parts[7]) + int(parts[8])
                 status = classify(depth, crossings, gap, tol, near)
@@ -165,8 +187,10 @@ def parse_report(raw: str, *, include_separate: bool = False, limit: int = 100) 
                 complete = True
             else:
                 raise ValueError(f"unknown record {tag!r}")
-        if not complete:
-            raise ValueError("report truncated")
+        if not complete or node_count < len(nodes) or node_count < 2 or candidates != len(pairs) or elapsed < 0:
+            raise ValueError("report counts do not match measurements")
+        if set(nodes) != {h for pair in seen_pairs for h in pair}:
+            raise ValueError("unmeasured node record")
     except (ValueError, IndexError, KeyError, UnicodeError) as exc:
         raise RuntimeError(f"Invalid contact check report: {exc}") from exc
 
@@ -235,19 +259,24 @@ _SCRIPT_TEMPLATE = r'''(
             )
         )
         local nCross = 0, crossPt = undefined
+        local visited = dotNetObject "System.Collections.Hashtable"
         for fi = 1 to (getNumFaces mA) do (
             local f = getFace mA fi
             local ids = #(f.x as integer, f.y as integer, f.z as integer)
             for k = 1 to 3 do (
                 local i1 = ids[k], i2 = ids[(mod k 3) + 1]
-                if i1 < i2 do (
+                -- Boundary edges occur once; winding is not a deduplication key.
+                local lo = amin i1 i2, hi = amax i1 i2
+                local edgeKey = (lo as integer64) * (nv as integer64) + hi
+                if not (visited.ContainsKey edgeKey) do (
+                    visited.Add edgeKey true
                     -- unmeasured endpoints lie outside B's padded box, so they are clear of B
                     local d1 = dist[i1], d2 = dist[i2]
                     if (d1 == undefined or d1 > tol) and (d2 == undefined or d2 > tol) and not inside[i1] and not inside[i2] do (
                         local p1 = getVert mA i1, p2 = getVert mA i2
                         if (amin p1.x p2.x) <= bbB[2].x and (amax p1.x p2.x) >= bbB[1].x and (amin p1.y p2.y) <= bbB[2].y and (amax p1.y p2.y) >= bbB[1].y and (amin p1.z p2.z) <= bbB[2].z and (amax p1.z p2.z) >= bbB[1].z and (rmB.intersectSegment p1 p2 true) > 0 do (
                             nCross += 1
-                            if crossPt == undefined do crossPt = p1 + (normalize (p2 - p1)) * (rmB.getHitDist 1)
+                            if crossPt == undefined do crossPt = p1 + (normalize (p2 - p1)) * (rmB.getHitDist (rmB.getClosestHit()))
                         )
                     )
                 )
@@ -287,17 +316,28 @@ _SCRIPT_TEMPLATE = r'''(
             setA = for n in geometry where not n.isHiddenInVpt and ccIsMesh n collect n
         )
         local nodes = setA + setB
+        local uniqueNodes = #()
+        for n in nodes do (
+            if (findItem uniqueNodes n) > 0 do throw "The same node resolved more than once; use disjoint unique targets"
+            append uniqueNodes n
+        )
+        if nodes.count > 2000 do throw "Too many nodes; narrow names/against to at most 2000 nodes"
         if nodes.count < 2 do throw "Need at least two mesh nodes (pass names, select nodes, or leave both empty for all visible geometry)"
         local bbs = for n in nodes collect #(n.min, n.max)
         -- candidate pairs by padded world bounding boxes
         local pairsI = #(), pairsJ = #()
         local nA = setA.count
         if setB.count > 0 then (
-            for i = 1 to nA do for j = nA + 1 to nodes.count do if ccBoxOverlap bbs[i] bbs[j] near do (append pairsI i; append pairsJ j)
+            for i = 1 to nA do for j = nA + 1 to nodes.count do if ccBoxOverlap bbs[i] bbs[j] near do (
+                if pairsI.count >= %(max_pairs)s do throw "Too many candidate pairs; narrow names/against or raise max_pairs"
+                append pairsI i; append pairsJ j
+            )
         ) else (
-            for i = 1 to nA do for j = i + 1 to nA do if ccBoxOverlap bbs[i] bbs[j] near do (append pairsI i; append pairsJ j)
+            for i = 1 to nA do for j = i + 1 to nA do if ccBoxOverlap bbs[i] bbs[j] near do (
+                if pairsI.count >= %(max_pairs)s do throw "Too many candidate pairs; narrow names/against or raise max_pairs"
+                append pairsI i; append pairsJ j
+            )
         )
-        if pairsI.count > %(max_pairs)s do throw ("Too many candidate pairs (" + pairsI.count as string + "); narrow names/against or raise max_pairs")
         local used = #{}
         for k = 1 to pairsI.count do (used[pairsI[k]] = true; used[pairsJ[k]] = true)
         local closed = #()
@@ -307,17 +347,20 @@ _SCRIPT_TEMPLATE = r'''(
             if m == undefined do throw ("No evaluated mesh: " + nodes[i].name)
             meshes[i] = m
             local nf = getNumFaces m
+            if nf == 0 do throw ("Empty evaluated mesh: " + nodes[i].name)
             if nf > %(max_faces)s do throw ("Face limit exceeded on " + nodes[i].name + " (" + nf as string + "); raise max_faces")
             closed[i] = (nf > 0) and ((meshop.getOpenEdges m).numberSet == 0)
             local rm = RayMeshGridIntersect()
+            rms[i] = rm
             rm.Initialize (amax 10 (amin 100 ((ceil ((nf / 2.0) ^ (1.0/3.0))) as integer)))
             rm.addNode nodes[i]
             rm.buildGrid()
-            rms[i] = rm
             local mp = MeshProjIntersect()
+            mps[i] = mp
             mp.setNode nodes[i]
             mp.build()
-            mps[i] = mp
+            -- Initialize ClosestFace; ignore this ray result and use rm for rays.
+            mp.intersectRay (bbs[i][1] - [1,1,1]) [1,0,0] doubleSided:true
             format "N|%%|%%|%%|%%\n" (formattedPrint ((getHandleByAnim nodes[i]) as integer64) format:"d") ((dotNetClass "System.Convert").ToBase64String ((dotNetClass "System.Text.Encoding").UTF8.GetBytes nodes[i].name)) nf (if closed[i] then 1 else 0) to:ss
         )
         for k = 1 to pairsI.count do (

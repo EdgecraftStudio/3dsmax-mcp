@@ -1,17 +1,4 @@
-"""Normalized map-role reads: which file actually plays which role in a material.
-
-`inspect_material_network` reports a role per wired slot and a flat file
-manifest, but the two are not joined: a slot points at a wrapper node
-(CoronaColorCorrect, CoronaNormal, a mix) and the bitmap hangs one or more
-levels below it. Every caller then has to walk that graph itself.
-
-This module does the walk once and answers the question directly: for each
-role, the file behind it, the wrapper chain it passes through, and whether the
-file name disagrees with the slot it is wired into.
-
-Slot wiring is the ground truth. File names are only a hint, used to flag
-disagreements, never to decide the role of a wired map.
-"""
+"""Read every texture source per material connection; filename hints are advisory."""
 
 from __future__ import annotations
 
@@ -55,26 +42,6 @@ SLOT_ROLE_TO_VOCAB: dict[str, str] = {
     "specular": "refl",
 }
 
-# Legacy and generic slots report role "map"; the slot's own name still says
-# what it is. Longest key wins.
-SLOT_NAME_TO_VOCAB: dict[str, str] = {
-    "texmapdiffuse": "dif",
-    "texmapreflectglossiness": "gloss",
-    "texmapreflect": "refl",
-    "texmaprefractglossiness": "gloss",
-    "texmaprefract": "trans",
-    "texmapbump": "bump",
-    "texmapopacity": "opac",
-    "texmapdisplacement": "disp",
-    "texmapselfillum": "emis",
-    "texmaptranslucency": "trans",
-    "texmapfresnelior": "ior",
-    "diffuse_map": "dif",
-    "bump_map": "bump",
-    "roughness_map": "rough",
-    "normal_map": "nrm",
-}
-
 # Detected file-name channels -> the same vocabulary.
 FILE_CHANNEL_TO_VOCAB: dict[str, str] = {
     "diffuse": "dif",
@@ -93,51 +60,25 @@ FILE_CHANNEL_TO_VOCAB: dict[str, str] = {
     "specular": "refl",
 }
 
-# Disagreements that are normal in production and must not be reported.
-# AO wired into roughness is deliberately NOT here: it is a common substitute for
-# a missing roughness map, but it is still worth surfacing so the artist decides.
-_ACCEPTED_MISMATCH = {
-    ("rough", "gloss"),   # Corona reads either, roughnessMode decides
-    ("gloss", "rough"),
-    ("nrm", "bump"),      # a normal map wired through a bump slot
-    ("bump", "nrm"),
-    ("dif", "ao"),        # AO multiplied into base color
-    ("refl", "met"),
-    ("disp", "bump"),
-}
-
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f]")
 
 
 def _clean(value: Any) -> Any:
-    """Strip control characters that some class names carry (a known upstream bug)."""
     return _CONTROL_CHARS.sub("", value) if isinstance(value, str) else value
 
 
-def fetch_network(client: MaxClient, name: str, depth: int = 4, max_nodes: int = 120) -> dict[str, Any]:
-    payload = {
-        "name": name,
-        "sub_material_index": 0,
-        "depth": depth,
-        "scope": "wired",
-        "include_values": False,
-        "verify_files": True,
-        "max_nodes": max_nodes,
-        "profile": "auto",
-    }
+def fetch_graphs(client: MaxClient, **arguments: Any) -> dict[str, Any]:
     response = client.send_command(
-        json.dumps(payload, separators=(",", ":")),
+        json.dumps({"action": "roles", **arguments}, separators=(",", ":")),
         cmd_type="native:inspect_material_network",
     )
-    return json.loads(response.get("result", "{}"))
+    payload = json.loads(response.get("result", "{}"))
+    if not isinstance(payload, dict) or payload.get("graphVersion") != 2 or "graphs" not in payload:
+        raise RuntimeError("material_roles requires a native bridge with material graph connections (graphVersion 2).")
+    return payload
 
 
 def _file_hint(path: str) -> tuple[str | None, str | None]:
-    """Return (vocab_role, detected_channel) guessed from a file name.
-
-    Single-letter aliases (``_s``, ``_g``, ``_m``) are too weak to contradict the
-    wiring on their own: ``cloud_fabric_2_s`` is not evidence of a specular map.
-    """
     detected = _detect_texture_channel(Path(path), _DEFAULT_CHANNEL_PATTERNS)
     if detected is None:
         return None, None
@@ -147,110 +88,136 @@ def _file_hint(path: str) -> tuple[str | None, str | None]:
     return FILE_CHANNEL_TO_VOCAB.get(channel), channel
 
 
-def _descend_to_file(node_id: str, by_id: dict[str, dict], children: dict[str, list[dict]],
-                     seen: set[str] | None = None) -> tuple[dict | None, list[str]]:
-    """Walk down from a slot's node to the first node carrying a file."""
-    seen = seen or set()
-    if node_id in seen:
-        return None, []
-    seen.add(node_id)
-    node = by_id.get(node_id)
-    if node is None:
-        return None, []
-    chain = [_clean(node.get("class", "?"))]
-    if node.get("files"):
-        return node, chain
-    for child in children.get(node_id, []):
-        found, sub_chain = _descend_to_file(child["id"], by_id, children, seen)
-        if found is not None:
-            return found, chain + sub_chain
-    return None, chain
+def _slot_role(edge: dict) -> str:
+    # Parameter names and UI aliases are more precise than the native coarse role.
+    labels = [edge.get("slot", ""), *edge.get("aliases", [])]
+    patterns = (
+        ("rough", "rough"), ("gloss", "gloss"), ("metal", "met"),
+        ("normal", "nrm"), ("bump", "bump"), ("displac", "disp"),
+        ("cutout", "opac"), ("opaci", "opac"), ("alpha", "opac"),
+        ("ior", "ior"), ("emission", "emis"), ("emiss", "emis"),
+        ("selfillum", "emis"), ("transluc", "trans"), ("transmis", "trans"),
+        ("refract", "trans"), ("occlusion", "ao"), ("scatter", "sss"),
+        ("basecolor", "dif"), ("diffuse", "dif"),
+        ("reflect", "refl"), ("specular", "refl"),
+    )
+    for label in labels:
+        key = re.sub(r"[^a-z0-9]", "", str(label).lower())
+        for token, role in patterns:
+            if token in key:
+                return role
+    raw = str(edge.get("role") or "map").lower()
+    return SLOT_ROLE_TO_VOCAB.get(raw, "unknown" if raw == "map" else raw)
 
 
 def roles_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    nodes = payload.get("nodes") or []
-    by_id = {n["id"]: n for n in nodes if "id" in n}
+    if payload.get("graphVersion") != 2:
+        raise ValueError("Material graph lacks explicit connections; refusing an incomplete tree-based audit.")
+    by_id = {n["id"]: n for n in payload.get("nodes", [])}
     children: dict[str, list[dict]] = {}
-    for node in nodes:
-        parent = node.get("parentId")
-        if parent:
-            children.setdefault(parent, []).append(node)
-
-    # inputType 2 is the native parameter slot and is authoritative; the UI-label
-    # duplicates (inputType 0) only fill in roles the native pass did not name.
-    best_slots: dict[str, dict] = {}
-    for slot in payload.get("wiredSlots") or []:
-        node_id = slot.get("nodeId")
-        if not node_id:
-            continue
-        current = best_slots.get(node_id)
-        if current is None or (slot.get("inputType") == 2 and current.get("inputType") != 2):
-            best_slots[node_id] = slot
-
+    for edge in payload.get("edges", []):
+        children.setdefault(edge["parentId"], []).append(edge)
     entries: list[dict[str, Any]] = []
-    for node_id, slot in best_slots.items():
-        raw_role = str(slot.get("role") or "").lower()
-        slot_name = str(_clean(slot.get("slot")) or "")
-        role = SLOT_ROLE_TO_VOCAB.get(raw_role)
-        if role is None:
-            key = slot_name.lower().replace(" ", "").replace(".", "")
-            role = next((v for k, v in sorted(SLOT_NAME_TO_VOCAB.items(),
-                                              key=lambda kv: -len(kv[0])) if key.startswith(k)), None)
-        if role is None:
-            # "map" on a Multi/Sub-Object entry is a sub-material, not a texture role.
-            role = "submaterial" if slot_name.lower().startswith("materiallist") else (raw_role or "unknown")
-        file_node, chain = _descend_to_file(node_id, by_id, children)
-        entry: dict[str, Any] = {
-            "role": role,
-            "slot": _clean(slot.get("slot")),
-            "slot_role_raw": raw_role,
-            "node_chain": chain,
-            "file": None,
-            "node_name": None,
-            "file_hint": None,
-            "mismatch": False,
-        }
-        if file_node is not None:
-            first_file = (file_node.get("files") or [{}])[0]
-            path = first_file.get("path")
-            entry["file"] = path
-            entry["node_name"] = _clean(file_node.get("name"))
-            if path:
-                hint, channel = _file_hint(path)
-                entry["file_hint"] = hint or channel
-                comparable = role not in {"submaterial", "map", "unknown", ""}
-                if comparable and hint and hint != role and (role, hint) not in _ACCEPTED_MISMATCH:
-                    entry["mismatch"] = True
-        entries.append(entry)
+    issues = list(payload.get("issues") or [])
+    warnings = list(payload.get("warnings") or [])
+    truncated = dict(payload.get("truncated") or {})
+    complete = payload.get("complete") is True and not any(truncated.values())
+    visits = 0
+    max_visits, max_entries = 10000, 2000
 
-    entries.sort(key=lambda e: (e["role"], e["slot"] or ""))
+    def incomplete(code: str, node_id: str, message: str) -> None:
+        nonlocal complete
+        complete = False
+        issue = {"code": code, "nodeId": node_id, "message": message}
+        if issue not in issues:
+            issues.append(issue)
+
+    def enter(node_id: str, seen: frozenset[str]) -> dict | None:
+        nonlocal visits
+        visits += 1
+        if visits > max_visits or len(entries) >= max_entries:
+            incomplete("PATH_LIMIT", "", "Source traversal limit reached; narrow the material query.")
+            return None
+        if node_id in seen:
+            incomplete("CIRCULAR_REF", node_id, "Circular source connection.")
+            return None
+        if node_id not in by_id:
+            incomplete("MISSING_NODE", node_id, "A connection target was omitted from the graph.")
+            return None
+        return by_id[node_id]
+
+    def sources(node_id: str, seen: frozenset[str], chain: list[dict], path: list[str]):
+        node = enter(node_id, seen)
+        if node is None:
+            return
+        chain = [*chain, node]
+        files = [f for f in node.get("files", []) if f.get("path")]
+        for file in files:
+            yield file, chain, path
+        outgoing = children.get(node_id, [])
+        if not files and not outgoing:
+            yield None, chain, path  # A procedural map can legitimately have no file.
+        for edge in outgoing:
+            if visits > max_visits or len(entries) >= max_entries:
+                incomplete("PATH_LIMIT", "", "Source traversal limit reached; narrow the material query.")
+                break
+            yield from sources(edge["nodeId"], seen | {node_id}, chain, [*path, edge.get("slot", "")])
+
+    def material(node_id: str, seen: frozenset[str], material_path: list[str]) -> None:
+        node = enter(node_id, seen)
+        if node is None:
+            return
+        for edge in children.get(node_id, []):
+            if visits > max_visits or len(entries) >= max_entries:
+                incomplete("PATH_LIMIT", "", "Source traversal limit reached; narrow the material query.")
+                break
+            target_id = edge["nodeId"]
+            if edge.get("kind") == "material":
+                material(target_id, seen | {node_id}, [*material_path, edge.get("slot", "")])
+                continue
+            role = _slot_role(edge)
+            for file, chain, source_path in sources(target_id, seen | {node_id}, [], []):
+                if len(entries) >= max_entries:
+                    incomplete("PATH_LIMIT", "", "Source traversal limit reached; narrow the material query.")
+                    break
+                path = file.get("path") if file else None
+                hint, channel = _file_hint(path) if path else (None, None)
+                classes = [_clean(n.get("class", "?")) for n in chain]
+                # A mask is a control input, not the color/roughness value itself.
+                control = any("mask" in label.lower() or "mixamount" in label.lower().replace("_", "")
+                              for label in source_path)
+                expected = role
+                normal_adapter = any(c.lower().replace(" ", "") in {"normalbump", "coronanormal", "vraynormalmap"}
+                                     for c in classes[:-1])
+                normal_input = any("normal" in label.lower() for label in source_path)
+                if role == "bump" and normal_adapter and normal_input:
+                    expected = "nrm"
+                mismatch = bool(hint and expected != "unknown" and hint != expected and not control)
+                entries.append({
+                    "material": _clean(node.get("name")), "material_handle": node.get("handle"),
+                    "material_path": material_path, "role": role,
+                    "slot": _clean(edge.get("slot")), "slot_key": edge.get("slotKey"),
+                    "slot_role_raw": edge.get("role"), "node_chain": classes,
+                    "source_path": source_path, "source_usage": "control" if control else "value",
+                    "file": path, "file_parameter": file.get("param") if file else None,
+                    "exists": file.get("exists") if file else None,
+                    "node_id": chain[-1]["id"], "node_name": _clean(chain[-1].get("name")),
+                    "file_hint": hint or channel, "mismatch": mismatch,
+                    "mismatch_reason": (
+                        f"Filename suggests {hint}; connected to {role}. Check channel selection, map transforms and renderer modes."
+                        if mismatch else None),
+                })
+
     root = payload.get("root") or {}
+    material(root.get("id", "n0"), frozenset(), [])
     return {
-        "material": _clean(payload.get("query")),
-        "class": _clean(root.get("class")),
-        "renderer": root.get("rendererProfile"),
+        "material": _clean(payload.get("query")), "material_handle": root.get("handle"),
+        "class": _clean(root.get("class")), "renderer": root.get("rendererProfile"),
         "owner": _clean(payload.get("owner")),
         "texture_folder": (payload.get("hints") or {}).get("textureFolderGuess"),
-        "roles": entries,
-        "missing_files": [
-            _clean(f.get("path"))
-            for f in (payload.get("fileManifest") or [])
-            if f.get("exists") is False
-        ],
+        "roles": entries, "complete": complete, "truncated": truncated,
+        "missing_files": sorted({f["path"] for f in payload.get("fileManifest", [])
+                                 if f.get("path") and f.get("exists") is False}),
         "mismatches": [e for e in entries if e["mismatch"]],
-        "issues": payload.get("issues") or [],
+        "issues": issues, "warnings": warnings,
     }
-
-
-def scene_material_names(client: MaxClient, limit: int = 200) -> list[str]:
-    maxscript = f"""(
-    local out = ""
-    local shown = 0
-    for m in sceneMaterials while shown < {int(limit)} do (
-        out += m.name + "\\n"
-        shown += 1
-    )
-    out
-)"""
-    response = client.send_command(maxscript)
-    return [line.strip() for line in str(response.get("result", "")).splitlines() if line.strip()]
