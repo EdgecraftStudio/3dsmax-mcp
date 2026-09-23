@@ -65,7 +65,7 @@ See [Advanced configuration](docs/ADVANCED.md) for manual client setup and tool 
 
 **Build editable meshes from a reference**<br>
 Create polygon cages, sweeps, and lofts, then refine their components and check topology.<br>
-Tools: `create_mesh`, `curve_model`, `loft_mesh`, `mesh_edit`, `geometry_qa`
+Tools: `create_mesh`, `curve_model`, `loft_mesh`, `mesh_edit`, `geometry_qa`, `silhouette_compare`
 
 ### Materials
 
@@ -170,6 +170,7 @@ Automate repetitive work with MAXScript, or build procedural geometry and modifi
 | `mesh_edit` | Undoable vertex, edge and face edits that preserve the modifier stack |
 | `loft_mesh` | Matched-section quad lofts with persistent numeric parameters |
 | `geometry_qa` | Check mesh boundaries, winding, degeneracy and connected components |
+| `object_id_view` / `silhouette_compare` | Flat per-object ID views in orthographic projections; compare the silhouette with a reference drawing |
 | `boolean_operation` | Apply, inspect, retune, rename, or extract Boolean modifier operands; supports inline repeated cutters |
 | `draw_spline` | Create, read, and edit spline shapes from explicit world-space points and knots |
 | `edit_vertices` | Read, move, set, or conform Editable Poly vertices in world space |
