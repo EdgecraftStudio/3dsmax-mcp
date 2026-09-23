@@ -10,6 +10,8 @@ Skip skill install: uv run python install.py --skip-skill
 
 import argparse
 import base64
+import csv
+import filecmp
 import json
 import os
 import re
@@ -324,10 +326,38 @@ def stage_bundle(dest: Path) -> tuple[list[int], list[int]]:
     return included, missing
 
 
+def running_max_processes() -> list[str]:
+    """Return running 3ds Max processes; each keeps its loaded bridge locked."""
+    try:
+        result = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True,
+                                text=True, errors="replace", timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [f"{row[0]} (pid {row[1]})" for row in csv.reader(result.stdout.splitlines())
+            if len(row) > 1 and row[0].lower() in {"3dsmax.exe", "3dsmaxbatch.exe"}]
+
+
+def package_differences(staging: Path, dest: Path) -> list[str]:
+    """Return staged files that are missing from dest or differ there."""
+    differences = []
+    for src in sorted(p for p in staging.rglob("*") if p.is_file()):
+        relative = src.relative_to(staging)
+        target = dest / relative
+        if not target.is_file() or not filecmp.cmp(src, target, shallow=False):
+            differences.append(str(relative))
+    return differences
+
+
 def deploy_application_package() -> bool:
     print(f"\n[2/4] Application package -> {APPLICATION_PACKAGE_DST}")
     if not MS_SERVER.exists():
         print(f"  FAILED: missing {MS_SERVER}")
+        return False
+    # A loaded bridge cannot be replaced; a partial copy leaves a broken package.
+    running = running_max_processes()
+    if running:
+        print(f"  FAILED: close 3ds Max first ({', '.join(running)}).")
+        print(f"  {APPLICATION_PACKAGE_DST} was left unchanged.")
         return False
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -337,9 +367,9 @@ def deploy_application_package() -> bool:
             if APPLICATION_PACKAGE_DST.exists():
                 shutil.rmtree(APPLICATION_PACKAGE_DST)
             shutil.copytree(staging, APPLICATION_PACKAGE_DST)
-        except (PermissionError, OSError):
+        except (PermissionError, OSError) as error:
             # ProgramData ACLs can leave an admin-owned tree behind; retry elevated
-            print(f"  Need admin rights for {APPLICATION_PACKAGE_DST}")
+            print(f"  Could not replace {APPLICATION_PACKAGE_DST} ({error}); retrying with admin rights")
             cmd = (
                 f'rmdir /S /Q "{APPLICATION_PACKAGE_DST}" & '
                 f'xcopy /E /I /Y "{staging}" "{APPLICATION_PACKAGE_DST}"'
@@ -349,9 +379,11 @@ def deploy_application_package() -> bool:
                  f'Start-Process -FilePath cmd.exe -ArgumentList \'/c {cmd}\' -Verb RunAs -Wait'],
                 capture_output=True, timeout=60,
             )
-            if not (APPLICATION_PACKAGE_DST / "PackageContents.xml").exists():
-                print(f"  FAILED: could not deploy to {APPLICATION_PACKAGE_DST}")
-                return False
+        incomplete = package_differences(staging, APPLICATION_PACKAGE_DST)
+    if incomplete:
+        print(f"  FAILED: {APPLICATION_PACKAGE_DST} is incomplete: {', '.join(incomplete)}")
+        print("  Close 3ds Max and any program using these files, then run the installer again.")
+        return False
 
     for year in included:
         print(f"  OK: Contents/bin/mcp_bridge_{year}.gup")
