@@ -298,15 +298,11 @@ def parse_image_report(raw: str) -> dict[str, Any]:
             raise ValueError("pixel data size mismatch")
     except (ValueError, UnicodeError) as exc:
         raise RuntimeError(f"Invalid image report: {exc}") from exc
-    lum = bytearray(w * h)
-    alpha = bytearray(w * h)
-    for y in range(h):
-        row = y * stride
-        for x in range(w):
-            i = row + 4 * x
-            b, g, r, a = data[i], data[i + 1], data[i + 2], data[i + 3]
-            lum[y * w + x] = (299 * r + 587 * g + 114 * b) // 1000
-            alpha[y * w + x] = a
+    if stride != 4 * w:
+        data = b"".join(data[y * stride:y * stride + 4 * w] for y in range(h))
+    bs, gs, rs, al = data[0::4], data[1::4], data[2::4], data[3::4]
+    lum = bytearray((299 * r + 587 * g + 114 * b) // 1000 for b, g, r in zip(bs, gs, rs))
+    alpha = bytearray(al)
     return {"source_width": int(sw), "source_height": int(sh), "width": w, "height": h, "lum": lum, "alpha": alpha}
 
 
@@ -333,6 +329,55 @@ def dilate(mask: bytearray, w: int, h: int, radius: int) -> bytearray:
                         or (y > 0 and src[row - w + x]) or (y < h - 1 and src[row + w + x])):
                     out[row + x] = 1
     return out
+
+
+def _rows(mask: bytearray, w: int, h: int) -> list[int]:
+    """Rows as ints: pixel x is bit 8*x (one byte per pixel)."""
+    return [int.from_bytes(bytes(reversed(mask[y * w:(y + 1) * w])), "big") for y in range(h)]
+
+
+def _unrows(rows: list[int], w: int) -> bytearray:
+    out = bytearray()
+    for r in rows:
+        out.extend(reversed((r & ((1 << (8 * w)) - 1)).to_bytes(w, "big")))
+    return bytearray(1 if b else 0 for b in out)
+
+
+def open_strokes(mask: bytearray, w: int, h: int, k: int) -> bytearray:
+    """Morphological opening with a k x k square: strokes thinner than k px vanish."""
+    if k <= 1:
+        return bytearray(mask)
+    rows = _rows(mask, w, h)
+    er = []
+    for r in rows:
+        e = r
+        for s in range(1, k):
+            e &= r >> (8 * s)
+        er.append(e)
+    er = [(lambda y: _and_down(er, y, k))(y) for y in range(h)]
+    di = []
+    for r in er:
+        d = r
+        for s in range(1, k):
+            d |= r << (8 * s)
+        di.append(d)
+    out = []
+    for y in range(h):
+        v = 0
+        for s in range(k):
+            if y - s >= 0:
+                v |= di[y - s]
+        out.append(v)
+    return _unrows(out, w)
+
+
+def _and_down(rows: list[int], y: int, k: int) -> int:
+    if y + k > len(rows):
+        return 0
+    v = rows[y]
+    for s in range(1, k):
+        v &= rows[y + s]
+    return v
 
 
 def fill_enclosed(ink: bytearray, w: int, h: int) -> bytearray:

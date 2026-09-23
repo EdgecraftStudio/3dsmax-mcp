@@ -77,6 +77,9 @@ def silhouette_compare(
     threshold: int = 160,
     close_gaps: int = 1,
     largest_only: bool = True,
+    line_weight: str = "all",
+    heavy_px: int = 2,
+    max_image_side: int = 2048,
     resolution: int = 384,
 ) -> dict[str, Any]:
     """Compare the model's silhouette in an orthographic view with a reference drawing.
@@ -87,6 +90,13 @@ def silhouette_compare(
     counts as inside. Images with transparency use alpha instead. threshold
     (0..255) decides what counts as ink; close_gaps dilates ink by that many
     pixels to seal small breaks; largest_only drops title blocks and text.
+
+    line_weight="heavy" keeps only strokes at least heavy_px source pixels thick
+    before filling. Use it for real technical drawings: dimension, extension and
+    centre lines, hatching and floor lines are drawn thin and otherwise close off
+    regions that are not part of the object. Visible outlines must be the heavy
+    lines. max_image_side caps the analysed size; keep it near the source size
+    in heavy mode so thin and heavy lines stay distinguishable.
 
     fit decides how the two are scaled before overlap is measured:
       height  - same height, bottom-centre aligned (default; proportions show as width error)
@@ -108,13 +118,28 @@ def silhouette_compare(
     si.check_int(threshold, "threshold", 1, 254)
     si.check_int(close_gaps, "close_gaps", 0, 5)
     si.check_int(resolution, "resolution", 64, 1024)
+    if line_weight not in {"all", "heavy"}:
+        raise ValueError("line_weight must be all or heavy")
+    si.check_int(heavy_px, "heavy_px", 2, 20)
+    si.check_int(max_image_side, "max_image_side", 256, 4096)
     if not isinstance(largest_only, bool):
         raise ValueError("largest_only must be true or false")
 
     img = si.parse_image_report(str(client.send_command(
-        si.build_image_script(reference.strip(), crop_l, 1024)).get("result", "")))
+        si.build_image_script(reference.strip(), crop_l, max_image_side)).get("result", "")))
     w, h = img["width"], img["height"]
+    src_w = crop_l[2] if crop_l else img["source_width"]
+    scale = w / src_w
     ink, source = si.ink_mask(img["lum"], img["alpha"], threshold)
+    warnings = []
+    stroke_k = 0
+    if source == "ink" and line_weight == "heavy":
+        stroke_k = max(2, round(heavy_px * scale))
+        if scale < 0.75:
+            warnings.append(f"The drawing was scaled to {scale:.2f} of its size; thin and heavy lines may blur together. Raise max_image_side or crop.")
+        ink = si.open_strokes(ink, w, h, stroke_k)
+        if not any(ink):
+            raise RuntimeError("line_weight=heavy removed every stroke; lower heavy_px or use line_weight=all")
     if source == "ink" and close_gaps:
         ink = si.dilate(ink, w, h, close_gaps)
     ref_mask = si.fill_enclosed(ink, w, h) if source == "ink" else ink
@@ -123,7 +148,6 @@ def silhouette_compare(
         ref_mask, components = si.keep_largest(ref_mask, w, h)
     ink_px = sum(ink) or 1
     filled_px = sum(ref_mask)
-    warnings = []
     if source == "ink" and filled_px < ink_px * 1.5:
         warnings.append("The reference barely filled: its outline is probably open. Raise close_gaps, lower threshold, or crop tighter.")
 
@@ -133,6 +157,8 @@ def silhouette_compare(
     cw, ch, a, b = cmp.pop("canvas")
     diff_path = _save_png("silhouette_diff", cw, ch, si.diff_image(a, b))
     id_path = _save_png("object_id", rep["width"], rep["height"], si.id_image(rep["ids"], len(rep["nodes"])))
+    if line_weight == "all" and source == "ink" and abs(cmp["aspect_error_pct"]) > 15:
+        warnings.append("Large aspect error. If the drawing has dimension, centre or floor lines or hatching, retry with line_weight='heavy'; check diff_file.")
     mb = cmp.pop("model_bbox_px")
     rb = cmp.pop("reference_bbox_px")
     px = rep["pixel_size"]
@@ -144,6 +170,7 @@ def silhouette_compare(
         "reference_bbox_px": list(rb),
         "reference_source": source,
         "reference_components": components,
+        "line_weight": line_weight, "stroke_filter_px": stroke_k,
         "reference_image": {"source_size": [img["source_width"], img["source_height"]], "analysed_size": [w, h], "crop": crop_l},
         "diff_file": diff_path,
         "object_id_file": id_path,
