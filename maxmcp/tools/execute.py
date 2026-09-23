@@ -15,6 +15,11 @@ def execute_maxscript(code: str = "", command: str = "") -> str:
     Use when: no dedicated MCP tool covers the operation (custom one-offs, rare APIs).
     Not when: objects, materials, selection, transforms, modifiers, layers, or scene queries —
     prefer the matching dedicated tool instead of raw MAXScript.
+
+    Always pass #noPrompt to importFile, including OBJ/FBX imports:
+    importFile @"C:/assets/model.fbx" #noPrompt
+    Import dialogs block execution and can cause MCP timeouts. Configure importer
+    options before importing; do not override #noPrompt with quiet:false.
     """
     script = code or command
     if not script:

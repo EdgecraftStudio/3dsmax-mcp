@@ -404,6 +404,7 @@ The installer builds an agent skill from `skills/3dsmax-mcp-dev/SKILL.md` with t
 
 ## Further reading
 
+- **[Contributing](CONTRIBUTING.md)** — development, validation, and pull requests
 - **[Advanced configuration](docs/ADVANCED.md)** — architecture, safe mode, tool profiles, native builds
 - **[CHANGELOG.md](docs/CHANGELOG.md)** — release history
 - **[LICENSE](LICENSE)**

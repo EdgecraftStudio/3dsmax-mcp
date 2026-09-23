@@ -233,6 +233,7 @@ The `code` string is delivered as a JSON value, so it is **un-escaped once befor
 
 ## MAXScript Pitfalls
 
+- **Always pass `#noPrompt` to `importFile`**, including OBJ/FBX imports. Import dialogs block execution and can cause MCP timeouts. Configure importer options before importing; do not override this with `quiet:false`. Examples: `importFile @"C:/assets/model.obj" #noPrompt` and `importFile @"C:/assets/model.fbx" #noPrompt using:FBXIMP`.
 - **No parens with keyword args**: `Box width:10` not `Box() width:10`
 - **Wrap in try/catch**: `try (...) catch (ex) (ex)`
 - **`Noise` vs `Noisemodifier`**: texture map vs modifier

@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [1.7.3] — 2026-09-23
+
+- Added OpenCode client registration with preserved JSONC settings.
+- Added `importFile #noPrompt` guidance to prevent import dialogs from blocking MCP calls.
+- Fixed UTF-8 paths in material texture remapping.
+
 - Added `material_roles` for texture sources across shared maps, composites and submaterials, with missing-file checks, advisory filename mismatches and paged scene scans.
 - Material graph inspection now preserves every connection and reports depth/node/edge truncation.
 - Added `contact_check`, a read-only pairwise check for parts that penetrate, cross, touch or float just short of contact, with depth, gap and world-space sample points.

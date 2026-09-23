@@ -19,6 +19,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from maxmcp.opencode_config import resolve_opencode_config, update_opencode
+
 ROOT = Path(__file__).resolve().parent
 # Installed from a wheel this file is `maxmcp/installer.py`, so ROOT is the package
 # directory; from a checkout it is `install.py` and ROOT is the repo root. The Max-side
@@ -519,6 +521,39 @@ def register_app_mcp_configs(repo_dir: str) -> None:
             print(f"  OK: {label} ({config_path})")
         else:
             print(f"  Already up to date: {label}")
+    register_opencode(repo_dir)
+
+
+def register_opencode(repo_dir: str) -> bool:
+    path = resolve_opencode_config(Path.home())
+    temporary = None
+    try:
+        before = path.read_bytes() if path.exists() else None
+        content = update_opencode(before.decode("utf-8-sig") if before is not None else "{}\n", {
+            "type": "local", "command": mcp_server_command(repo_dir), "enabled": True,
+        })
+        if content == before:
+            print(f"  Already up to date: OpenCode ({path})")
+            return True
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".3dsmax-mcp-", dir=path.parent)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+        if (path.read_bytes() if path.exists() else None) != before:
+            raise OSError("Settings changed during installation; close OpenCode and retry")
+        if before is not None:
+            backup = path.with_suffix(path.suffix + ".3dsmax-mcp.bak")
+            if not backup.exists():
+                backup.write_bytes(before)
+        os.replace(temporary, path)
+        print(f"  OK: OpenCode ({path})")
+        return True
+    except (OSError, ValueError) as exc:
+        print(f"  SKIP: OpenCode ({path}): {exc}")
+        return False
+    finally:
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
 
 
 def register_agents() -> bool:
