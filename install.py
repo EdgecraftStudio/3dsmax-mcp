@@ -514,17 +514,38 @@ def register_app_mcp_configs(repo_dir: str) -> None:
             print(f"  SKIP: {label} (cannot create {config_path.parent})")
             continue
         try:
-            config = json.loads(config_path.read_text("utf-8")) if config_path.exists() else {}
-        except Exception:
-            config = {}
-        servers = config.setdefault("mcpServers", {})
-        if servers.get("3dsmax-mcp") != entry:
-            servers["3dsmax-mcp"] = entry
-            config_path.write_text(json.dumps(config, indent=2) + "\n", "utf-8")
-            print(f"  OK: {label} ({config_path})")
-        else:
+            text = config_path.read_text("utf-8-sig") if config_path.exists() else ""
+            config = json.loads(text) if text.strip() else {}
+            servers = config.setdefault("mcpServers", {}) if isinstance(config, dict) else None
+            if not isinstance(servers, dict):
+                raise ValueError("mcpServers is not an object")
+        except (OSError, ValueError) as exc:
+            # Never replace settings we cannot read: they may hold other servers.
+            print(f"  SKIP: {label} (left unchanged, cannot read {config_path}: {exc})")
+            print(f'    Add manually under "mcpServers": "3dsmax-mcp": {json.dumps(entry)}')
+            continue
+        if servers.get("3dsmax-mcp") == entry:
             print(f"  Already up to date: {label}")
+            continue
+        servers["3dsmax-mcp"] = entry
+        try:
+            replace_file(config_path, (json.dumps(config, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+        except OSError as exc:
+            print(f"  SKIP: {label} ({config_path}: {exc})")
+            continue
+        print(f"  OK: {label} ({config_path})")
     register_opencode(repo_dir)
+
+
+def replace_file(path: Path, content: bytes) -> None:
+    """Write through a sibling temp file so an interrupted write cannot truncate settings."""
+    fd, temporary = tempfile.mkstemp(prefix=".3dsmax-mcp-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def register_opencode(repo_dir: str) -> bool:
