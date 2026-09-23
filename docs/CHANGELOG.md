@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Added `object_id_view` and `silhouette_compare`: deterministic orthographic object-ID views, and silhouette comparison against a reference drawing (IoU, aspect error, disagreement regions, diff image). Work with `safe_mode` on.
+
 ## [1.7.2] — 2026-09-15
 
 - Replaced `get_railclone_style_graph` with complete XML style read/write and generated-output tools for RailClone 7.3.5+.
