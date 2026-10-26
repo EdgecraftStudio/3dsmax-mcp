@@ -21,7 +21,11 @@ def _save_png(prefix: str, width: int, height: int, rgb: bytes | bytearray) -> s
 
 
 def _id_view(names: list[str], view: str, resolution: int, padding: float, max_nodes: int) -> dict[str, Any]:
-    raw = client.send_command(si.build_id_script(names, view, resolution, padding, max_nodes)).get("result", "")
+    # One MAXScript ray per pixel: a full frame at 1024 runs for minutes, past the
+    # default reply deadline, which would end the call with MAX_BUSY.
+    timeout = max(client.timeout, 60.0 + resolution * resolution / 4000.0)
+    raw = client.send_command(si.build_id_script(names, view, resolution, padding, max_nodes),
+                              timeout=timeout).get("result", "")
     return si.parse_id_report(str(raw))
 
 

@@ -22,7 +22,7 @@ import zlib
 from collections import deque
 from typing import Any
 
-from .maxscript import safe_string
+from .maxscript import node_by_name_expr, safe_string
 
 # Orthographic views as Max names them: (view direction, screen right, screen up).
 VIEWS: dict[str, tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]] = {
@@ -89,11 +89,14 @@ def build_id_script(names: list[str], view: str, resolution: int, padding: float
     return _ID_TEMPLATE % {
         "names": names_ms, "d": _p3(d), "r": _p3(r), "u": _p3(u),
         "res": resolution, "pad": format(padding, ".6g"), "max_nodes": max_nodes,
+        "resolve": node_by_name_expr("nm", "Node"),
     }
 
 
 _ID_TEMPLATE = r'''(
     fn siIsMesh n = isValidNode n and (isKindOf n GeometryClass) and not (isKindOf n TargetObject) and (canConvertTo n TriMeshGeometry)
+    -- Missing and shared names fail the call, as the native bridge resolves them.
+    fn siResolve nm = %(resolve)s
     local rm = undefined
     local result = undefined
     try (
@@ -102,10 +105,9 @@ _ID_TEMPLATE = r'''(
         local nodes = #()
         if namesIn.count > 0 then (
             for nm in namesIn do (
-                local m = getNodeByName nm exact:true all:true
-                if m.count != 1 do throw ("Node name must resolve uniquely: " + nm)
-                if not (siIsMesh m[1]) do throw ("Not a mesh-convertible geometry node: " + nm)
-                append nodes m[1]
+                local m = siResolve nm
+                if not (siIsMesh m) do throw ("Not a mesh-convertible geometry node: " + nm)
+                append nodes m
             )
         ) else if selection.count > 0 then (
             nodes = for n in selection where siIsMesh n collect n
