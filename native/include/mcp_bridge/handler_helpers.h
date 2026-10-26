@@ -1,7 +1,12 @@
 #pragma once
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <algorithm>
+#include <optional>
+#include <cmath>
+#include <functional>
 #include <stdexcept>
 #include <nlohmann/json.hpp>
 #include <max.h>
@@ -19,15 +24,32 @@
 #include <maxscript/maxscript.h>
 #include <maxscript/foundation/strings.h>
 #include <maxscript/maxwrapper/mxsobjects.h>
+#include <maxscript/compiler/parser.h>
 #include <CoreFunctions.h>
 #include "mcp_bridge/color_value.h"
-#include "mcp_bridge/dialog_watch.h"
+#include "mcp_bridge/quiet_policy.h"
 
 class MCPBridgeGUP;
+
+// Fails the current bridge operation when Max showed an error dialog during
+// it. Core code reaches the shell's DialogWatch through the host API
+// (core_bridge.cpp); shell code passes DialogWatch::ThrowIfDismissed itself.
+namespace McpHost::DialogWatch { void ThrowIfDismissed(); }
+// Runs work on Max's main thread, also from a direct handler (core_bridge.cpp).
+namespace McpHost { std::string RunOnMainThread(const std::function<std::string()>& work); }
 
 namespace HandlerHelpers {
 
 using json = nlohmann::json;
+
+// MAXScript's evaluator, value heap and class registry belong to Max's main
+// thread, and TempQuietMode switches a process-wide mode. Script work on any
+// other thread is a bridge defect: fail it before it touches MAXScript.
+inline void RequireMaxScriptThread() {
+    if (GetCurrentThreadId() == GetCOREInterface15()->GetMainThreadID()) return;
+    throw std::runtime_error(json{{"type", "NativeError"}, {"code", "INTERNAL_ERROR"}, {"retryable", false},
+        {"message", "Internal bridge error: MAXScript was called off 3ds Max's main thread; the script did not run"}}.dump());
+}
 
 // ── UTF-8 <-> Wide conversion ───────────────────────────────────
 inline std::string WideToUtf8(const wchar_t* w) {
@@ -105,6 +127,7 @@ inline std::string ScriptClassName(Animatable* value) {
 inline std::string MaxScriptVisibleClassName(
     SClass_ID superClassId,
     const Class_ID& classId) {
+    RequireMaxScriptThread();
     ScopedMaxScriptEvaluationContext evaluationContext;
     Class_ID lookupId = classId;
     MAXClass* maxClass = MAXClass::lookup_class(
@@ -187,24 +210,18 @@ inline void CollectNodes(INode* node, std::vector<INode*>& out) {
     }
 }
 
-inline std::vector<INode*> CollectNodesByExactName(const std::string& name) {
-    Interface* ip = GetCOREInterface();
-    INode* root = ip->GetRootNode();
-    std::vector<INode*> all, matched;
-    CollectNodes(root, all);
+// Nodes named `name`. Exact matches win; when there is none, names that differ
+// only in letter case match, as MAXScript name lookups do.
+inline std::vector<INode*> CollectNodesByName(const std::string& name) {
+    std::vector<INode*> all, exact, caseless;
+    CollectNodes(GetCOREInterface()->GetRootNode(), all);
+    const std::wstring wide = Utf8ToWide(name);
     for (INode* n : all) {
-        if (WideToUtf8(n->GetName()) == name) {
-            matched.push_back(n);
-        }
+        const MCHAR* nodeName = n->GetName();
+        if (wide == nodeName) exact.push_back(n);
+        else if (exact.empty() && _wcsicmp(nodeName, wide.c_str()) == 0) caseless.push_back(n);
     }
-    return matched;
-}
-
-// ── Node lookup by name ─────────────────────────────────────────
-inline INode* FindNodeByName(const std::string& name) {
-    Interface* ip = GetCOREInterface();
-    std::wstring wname = Utf8ToWide(name);
-    return ip->GetINodeByName(wname.c_str());
+    return exact.empty() ? caseless : exact;
 }
 
 inline unsigned long long PayloadHandleValue(const json& payload, const std::string& key = "handle") {
@@ -251,6 +268,84 @@ inline std::string StructuredErrorPayload(
     return payload.dump();
 }
 
+// ── Node lookup by name ─────────────────────────────────────────
+// Max lets several objects share a name (imported "Object001", repeated
+// furniture), and Interface::GetINodeByName then returns either one. A name
+// therefore resolves only when exactly one object carries it; a shared name
+// fails with every candidate's identity instead of acting on a guess.
+inline constexpr const char* kPassHandleAdvice = "Pass handle to disambiguate this object name.";
+inline constexpr const char* kUniqueNamesAdvice =
+    "This tool takes object names only. Give the objects unique names first "
+    "(set_object_property with handle and property \"name\", or scene_patch rename), then retry.";
+
+inline json NameCandidatesJson(const std::vector<INode*>& matches) {
+    json candidates = json::array();
+    for (INode* node : matches) candidates.push_back(NodeIdentityJson(node));
+    return candidates;
+}
+
+[[noreturn]] inline void ThrowAmbiguousName(
+    const std::string& name, const std::vector<INode*>& matches, const char* advice) {
+    throw std::runtime_error(StructuredErrorPayload(
+        "AMBIGUOUS",
+        "Ambiguous object name: " + name,
+        {{"message", advice}, {"candidates", NameCandidatesJson(matches)}}));
+}
+
+// The one object with this exact name, or nullptr when none has it; the
+// caller reports a missing name in its own words.
+inline INode* FindUniqueNodeByName(const std::string& name, const char* advice = kUniqueNamesAdvice) {
+    const std::vector<INode*> matches = CollectNodesByName(name);
+    if (matches.size() > 1) ThrowAmbiguousName(name, matches, advice);
+    return matches.empty() ? nullptr : matches.front();
+}
+
+// ── Transform readback ──────────────────────────────────────────
+// Constraint, script and expression controllers ignore Move, Rotate, Scale
+// and SetNodeTM without an error, so edits compare the node transform before
+// and after each requested part.
+inline bool SameTransform(const Matrix3& a, const Matrix3& b) {
+    for (int row = 0; row < 4; ++row) {
+        for (int axis = 0; axis < 3; ++axis) {
+            const float x = a.GetRow(row)[axis];
+            const float y = b.GetRow(row)[axis];
+            if (std::fabs(x - y) > 1e-6f * (std::max)({1.0f, std::fabs(x), std::fabs(y)})) return false;
+        }
+    }
+    return true;
+}
+
+inline std::string ControllerClassName(Control* control) {
+    if (!control) return "";
+    MSTR name;
+    control->GetClassName(name, false);
+    return WideToUtf8(name.data());
+}
+
+// part is "move", "rotate" or "scale". A transform-level controller (Link,
+// LookAt) has no separate part controllers, so it is named instead.
+inline json IgnoredTransformPart(INode* node, const std::string& part) {
+    Control* tm = node->GetTMController();
+    Control* sub = nullptr;
+    if (tm) {
+        if (part == "move") sub = tm->GetPositionController();
+        else if (part == "rotate") sub = tm->GetRotationController();
+        else sub = tm->GetScaleController();
+    }
+    return {{"part", part}, {"controller", ControllerClassName(sub ? sub : tm)}};
+}
+
+inline constexpr const char* kTransformIgnoredAdvice =
+    "Edit the controller's targets or values instead, or use assign_controller to give the track "
+    "a keyframable controller.";
+
+// MAXScript expression for a node already resolved here. getAnimByHandle
+// reaches it by its animatable handle, so the script never looks the node up
+// by name again.
+inline std::string NodeScriptRef(INode* node) {
+    return "(getAnimByHandle " + std::to_string(NodeHandle(node)) + ")";
+}
+
 inline INode* ResolveNodeFromPayload(
     const json& payload,
     const std::string& nameKey = "name",
@@ -270,25 +365,11 @@ inline INode* ResolveNodeFromPayload(
         throw std::runtime_error(nameKey + " or " + handleKey + " is required");
     }
 
-    std::vector<INode*> matches = CollectNodesByExactName(name);
-    if (matches.empty()) {
+    INode* node = FindUniqueNodeByName(name, kPassHandleAdvice);
+    if (!node) {
         throw std::runtime_error("Object not found: " + name);
     }
-    if (matches.size() > 1) {
-        json candidates = json::array();
-        for (INode* node : matches) {
-            candidates.push_back(NodeIdentityJson(node));
-        }
-        json hint = {
-            {"message", "Pass handle to disambiguate this object name."},
-            {"candidates", candidates},
-        };
-        throw std::runtime_error(StructuredErrorPayload(
-            "AMBIGUOUS",
-            "Ambiguous object name: " + name,
-            hint));
-    }
-    return matches[0];
+    return node;
 }
 
 // MAXScript-level wrap that captures runtime exceptions (parse errors still
@@ -296,22 +377,262 @@ inline INode* ResolveNodeFromPayload(
 // returns either the user's value, or a string with this sentinel prefix.
 inline const char* MaxScriptErrorSentinel() { return "__MCP_MS_ERR__:"; }
 
+// Joins names for a warning. Callers keep the text free of "not found:",
+// which the Python envelope reads as an error even inside a success payload.
+inline std::string JoinNames(const json& names, size_t limit = 10) {
+    std::string out;
+    size_t shown = 0;
+    for (const auto& entry : names) {
+        if (shown == limit) { out += ", ..."; break; }
+        if (shown++) out += ", ";
+        if (entry.type() == json::value_t::string) out += entry.get<std::string>();
+        else if (entry.is_object() && entry.contains("name") &&
+                 entry["name"].type() == json::value_t::string) out += entry["name"].get<std::string>();
+        else if (entry.is_object() && entry.contains("handle")) out += "handle " + entry["handle"].dump();
+        else out += entry.dump();
+    }
+    return out;
+}
+
+// ── Batch name resolution ───────────────────────────────────────
+// A batch edit applies each requested name to the one object carrying it.
+// A name several objects share is applied to none of them: like a missing
+// name, it is skipped and reported, with its candidates.
+struct NamedNodes {
+    std::vector<INode*> nodes;        // request order, each node once
+    json notFound = json::array();    // names no object carries
+    json ambiguous = json::array();   // {name, candidates} per shared name
+    bool Unresolved() const { return !notFound.empty() || !ambiguous.empty(); }
+};
+
+inline json AmbiguousNameJson(const std::string& name, const std::vector<INode*>& matches) {
+    return {{"name", name}, {"candidates", NameCandidatesJson(matches)}};
+}
+
+inline NamedNodes ResolveNodesByNames(const std::vector<std::string>& names) {
+    // One scene walk serves the whole list.
+    std::unordered_map<std::string, std::vector<INode*>> byName;
+    for (const auto& name : names) byName.emplace(name, std::vector<INode*>{});
+    std::vector<INode*> all;
+    CollectNodes(GetCOREInterface()->GetRootNode(), all);
+    for (INode* node : all) {
+        auto it = byName.find(WideToUtf8(node->GetName()));
+        if (it != byName.end()) it->second.push_back(node);
+    }
+    // As in CollectNodesByName: a name with no exact match may match by case alone.
+    for (auto& entry : byName) {
+        if (!entry.second.empty()) continue;
+        const std::wstring wide = Utf8ToWide(entry.first);
+        for (INode* node : all)
+            if (_wcsicmp(node->GetName(), wide.c_str()) == 0) entry.second.push_back(node);
+    }
+
+    NamedNodes out;
+    std::unordered_set<INode*> seen;
+    std::unordered_set<std::string> reported;
+    for (const auto& name : names) {
+        const std::vector<INode*>& matches = byName[name];
+        if (matches.empty()) {
+            out.notFound.push_back(name);
+        } else if (matches.size() > 1) {
+            if (reported.insert(name).second) out.ambiguous.push_back(AmbiguousNameJson(name, matches));
+        } else if (seen.insert(matches.front()).second) {
+            out.nodes.push_back(matches.front());
+        }
+    }
+    return out;
+}
+
+// Error code for a batch that applied nothing because of its names.
+inline const char* UnresolvedNamesCode(const NamedNodes& resolved) {
+    return resolved.notFound.empty() && !resolved.ambiguous.empty() ? "AMBIGUOUS" : "NOT_FOUND";
+}
+
+inline json UnresolvedNamesHint(const NamedNodes& resolved, json hint = json::object()) {
+    hint["notFound"] = resolved.notFound;
+    if (!resolved.ambiguous.empty()) {
+        hint["ambiguous"] = resolved.ambiguous;
+        hint["message"] = kUniqueNamesAdvice;
+    }
+    return hint;
+}
+
+// Fails a batch in which no requested name matched exactly one object.
+// consequence says what was left unchanged.
+[[noreturn]] inline void ThrowUnresolvedNames(
+    const NamedNodes& resolved, const std::string& consequence, const json& hint = json::object()) {
+    const char* reason = resolved.ambiguous.empty()
+        ? "No object matched the requested names; "
+        : resolved.notFound.empty()
+            ? "Each requested name is shared by several objects; "
+            : "No requested name matched exactly one object; ";
+    throw std::runtime_error(StructuredErrorPayload(
+        UnresolvedNamesCode(resolved), reason + consequence, UnresolvedNamesHint(resolved, hint)));
+}
+
+// Marks a batch result partial for the shared names it skipped.
+inline void AddAmbiguousNamesWarning(json& result, const json& ambiguous) {
+    if (ambiguous.empty()) return;
+    result["ambiguous"] = ambiguous;
+    result["status"] = "partial";
+    result["warnings"].push_back(std::to_string(ambiguous.size()) +
+        " requested name(s) are shared by several objects and were skipped: " + JoinNames(ambiguous) +
+        ". See ambiguous for each object's handle.");
+}
+
+inline const wchar_t* MaxScriptWrapPrefix() {
+    return L"(\n"
+           L"  local __mcp_err = undefined\n"
+           L"  local __mcp_res = try (\n";
+}
+inline const wchar_t* MaxScriptWrapSuffix() {
+    return L"\n  ) catch (__mcp_err = getCurrentException(); undefined)\n"
+           L"  if __mcp_err != undefined then (\"__MCP_MS_ERR__:\" + __mcp_err) else __mcp_res\n"
+           L")\n";
+}
+
 inline std::wstring WrapForErrorCapture(const std::wstring& wcmd) {
-    return std::wstring(
-        L"(\n"
-        L"  local __mcp_err = undefined\n"
-        L"  local __mcp_res = try (\n"
-    ) + wcmd + std::wstring(
-        L"\n  ) catch (__mcp_err = getCurrentException(); undefined)\n"
-        L"  if __mcp_err != undefined then (\"__MCP_MS_ERR__:\" + __mcp_err) else __mcp_res\n"
-        L")\n"
-    );
+    return MaxScriptWrapPrefix() + wcmd + MaxScriptWrapSuffix();
+}
+
+// One-line, length-bounded MAXScript error text for a response message.
+inline std::string CleanMaxScriptDetail(std::string detail) {
+    for (auto& c : detail) if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+    const size_t first = detail.find_first_not_of(" -");
+    detail.erase(0, first == std::string::npos ? detail.size() : first);
+    while (!detail.empty() && detail.back() == ' ') detail.pop_back();
+    if (detail.size() > 500) {
+        size_t cut = 500;
+        while (cut > 0 && (static_cast<unsigned char>(detail[cut]) & 0xC0) == 0x80) --cut;  // keep UTF-8 valid for json
+        detail = detail.substr(0, cut) + "...";
+    }
+    return detail;
+}
+
+// ExecuteMAXScriptScript also returns FALSE when a script is aborted by
+// something MAXScript try/catch does not catch (quitMax, escape, system
+// exceptions), so a FALSE is not proof of a parse error. This re-compiles the
+// same text WITHOUT evaluating it (Parser::compile only, never eval) to tell
+// the two apart. Main thread only; skipped while Max quits or off the main
+// thread. Shell and core both call it (RunMAXScript), so it reads Max's own
+// state only, never the shell's executor.
+// A parse error's detail comes from the unwrapped user text when that also
+// fails, so line numbers and quoted code are the user's, not the wrapper's.
+// Silent: compiler output goes to a private StringStream and CompileError is
+// caught here, so nothing reaches the Listener.
+// sdk_detail is the error text ExecuteMAXScriptScript returned (TYPE_TSTR in
+// its result): the parse-error detail when the compile check found none, and
+// appended as "Max reported: ..." to the other messages.
+// Sets *code to "BAD_PARAM" or "MAXSCRIPT_INTERRUPTED". Never throws.
+inline std::string MaxScriptFailureMessage(const std::wstring& wcmd, std::string* code = nullptr,
+                                           const std::string& sdk_detail = {}) {
+    static const char* kUnclassified =
+        "MAXScript execution failed: the script did not complete and the syntax check "
+        "could not run, so this is either a parse error or an interruption "
+        "(quitMax/resetMaxFile/exit, escape/abort, or a system exception).";
+    auto withSdk = [&sdk_detail](std::string message) {
+        try {
+            const std::string extra = CleanMaxScriptDetail(sdk_detail);
+            if (!extra.empty()) message += " Max reported: " + extra;
+        } catch (...) {}
+        return message;
+    };
+    if (code) *code = "BAD_PARAM";
+    try {
+        Interface7* ip = GetCOREInterface7();
+        if (ip && ip->QuitingApp()) {
+            if (code) *code = "MAXSCRIPT_INTERRUPTED";
+            return withSdk("MAXScript did not complete: 3ds Max is shutting down (e.g. after quitMax), "
+                           "so the syntax check was skipped. If the script ended the Max session that is expected.");
+        }
+        // The compile check uses MAXScript's thread state: main thread only.
+        if (GetCurrentThreadId() != GetCOREInterface15()->GetMainThreadID()) return withSdk(kUnclassified);
+
+        ScopedMaxScriptEvaluationContext context;
+        MAXScript_TLS* _tls = context.Get_TLS();
+        four_typed_value_locals_tls(StringStream* source, StringStream* errors, Parser* parser, StringStream* text);
+        // Parser updates the current-source thread locals; restore them on every path.
+        struct SourceRestore {
+            MAXScript_TLS* tls; decltype(_tls->source_file) file; decltype(_tls->current_pkg) pkg;
+            decltype(_tls->source_pos) pos; decltype(_tls->source_line) line; decltype(_tls->source_flags) flags;
+            ~SourceRestore() {
+                tls->source_file = file; tls->current_pkg = pkg; tls->source_pos = pos;
+                tls->source_line = line; tls->source_flags = flags;
+            }
+        } restoreSource{_tls, _tls->source_file, _tls->current_pkg, _tls->source_pos,
+                        _tls->source_line, _tls->source_flags};
+        // 0 = compiles, 1 = compile error (detail set), -1 = the check itself failed.
+        auto compileOnly = [&](const std::wstring& text, std::string& detail) -> int {
+            vl.source = new StringStream(text.c_str());
+            vl.errors = new StringStream();
+            vl.parser = new Parser(vl.errors);
+            int result = 0;
+            try {
+                MAXScriptException::ScopedMXSCallstackCaptureDisable noCallstack(_tls);
+                vl.source->flush_whitespace();
+                while (!vl.source->at_eos() || vl.parser->back_tracked) {
+                    vl.parser->compile(vl.source, MAXScript::ScriptSource::NonEmbedded);  // code is never eval()'d
+                    vl.source->flush_whitespace();
+                }
+                if (vl.parser->expr_level != 0) {
+                    result = 1;
+                    detail = "unexpected end of script";
+                }
+            } catch (CompileError& e) {
+                clear_error_source_data(_tls);  // this catch eats the mxs exception
+                result = 1;
+                vl.text = new StringStream();
+                e.sprin1(vl.text);
+                detail = WideToUtf8(vl.text->to_string());
+            } catch (...) {
+                clear_error_source_data(_tls);
+                result = -1;
+            }
+            vl.source->close();
+            return result;
+        };
+
+        std::string detail;
+        const int compiled = compileOnly(wcmd, detail);
+        if (compiled < 0) return withSdk(kUnclassified);
+        if (compiled == 0) {
+            if (code) *code = "MAXSCRIPT_INTERRUPTED";
+            return withSdk("MAXScript did not complete (not a parse error): the script was interrupted, e.g. by "
+                           "quitMax/resetMaxFile/exit, an escape/abort, or a system exception. If it ended or "
+                           "reset the Max session that is expected.");
+        }
+        const std::wstring prefix = MaxScriptWrapPrefix(), suffix = MaxScriptWrapSuffix();
+        if (wcmd.size() >= prefix.size() + suffix.size() &&
+            wcmd.compare(0, prefix.size(), prefix) == 0 &&
+            wcmd.compare(wcmd.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            std::string userDetail;
+            const std::wstring userText = wcmd.substr(prefix.size(), wcmd.size() - prefix.size() - suffix.size());
+            if (compileOnly(userText, userDetail) == 1 && !userDetail.empty()) detail = userDetail;
+        }
+        detail = CleanMaxScriptDetail(detail);
+        if (detail.empty()) detail = CleanMaxScriptDetail(sdk_detail);
+        return detail.empty()
+            ? std::string("MAXScript execution failed (parse error)")
+            : "MAXScript execution failed (parse error): " + detail;
+    } catch (...) {
+        return withSdk(kUnclassified);
+    }
 }
 
 // ── MAXScript execution (for hybrid handlers) ───────────────────
-inline std::string RunMAXScript(const std::string& script) {
-    // Tool scripts are batch work: prompts take their defaults.
-    TempQuietMode quiet;
+// Evaluates on the calling thread, which must be Max's main thread. Shell code
+// runs there already and passes its own dialog check.
+inline std::string RunMAXScript(
+    const std::string& script,
+    void (*throwIfDialogDismissed)()) {
+    RequireMaxScriptThread();
+    // Tool scripts are batch work: prompts take their defaults. Quiet mode is
+    // one process-wide flag that TempQuietMode saves and restores; it changes
+    // only here, on Max's main thread. A script that could prompt to save or
+    // discard the scene runs with quiet mode forced off, even if
+    // something else left Max quiet: its prompt must reach the agent, not
+    // take a default.
+    TempQuietMode quiet(QuietPolicy::MentionsSceneFileCommand(script) ? FALSE : TRUE);
     std::wstring wcmd = WrapForErrorCapture(Utf8ToWide(script));
     FPValue fpv;
     BOOL ok = FALSE;
@@ -330,10 +651,14 @@ inline std::string RunMAXScript(const std::string& script) {
 
     if (!ok) {
         const std::string detail = fpv.type == TYPE_TSTR && fpv.tstr ? WideToUtf8(fpv.tstr->data()) : "";
-        throw std::runtime_error("MAXScript execution failed: " + detail);
+        // Explicit code, so compiler detail quoting the script cannot be
+        // re-keyworded by NormalizeNativeError (e.g. "not found" -> NOT_FOUND).
+        std::string code;
+        std::string message = MaxScriptFailureMessage(wcmd, &code, detail);
+        throw std::runtime_error(StructuredErrorPayload(code, message));
     }
 
-    DialogWatch::ThrowIfDismissed();
+    throwIfDialogDismissed();
     // Convert FPValue to string
     if (fpv.type == TYPE_STRING || fpv.type == TYPE_FILENAME) {
         return WideToUtf8(fpv.s);
@@ -360,6 +685,50 @@ inline std::string RunMAXScript(const std::string& script) {
     // Never re-evaluate the script to stringify the result: scripts with side
     // effects (e.g. "max undo") would run twice.
     return "OK";
+}
+
+// Core code. A direct handler runs on a pipe thread, where ExecuteSync stays
+// inline: evaluation and result conversion are sent to Max's main thread.
+inline std::string RunMAXScript(const std::string& script) {
+    return McpHost::RunOnMainThread([&script] {
+        return RunMAXScript(script, &McpHost::DialogWatch::ThrowIfDismissed);
+    });
+}
+
+// Core code that reads the FPValue itself: no error wrapper, quiet mode or
+// dialog check. `read` runs on Max's main thread right after evaluation, while
+// the result is valid. False when the script failed.
+inline bool EvaluateMAXScript(const std::wstring& script, const std::function<void(FPValue&)>& read) {
+    bool ok = false;
+    McpHost::RunOnMainThread([&] {
+        RequireMaxScriptThread();
+        FPValue fpv;
+        ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::NonEmbedded, TRUE, &fpv) != FALSE;
+        if (ok) read(fpv);
+        return std::string();
+    });
+    return ok;
+}
+
+// RunMAXScript returns a runtime exception as a sentinel string, so a caller
+// that ignores the result reports success for an edit Max rejected. Mutations
+// use this form: the throw reaches the dispatcher, which cancels its undo hold.
+inline std::string RunMAXScriptChecked(const std::string& script) {
+    std::string result = RunMAXScript(script);
+    const std::string sentinel = MaxScriptErrorSentinel();
+    if (result.compare(0, sentinel.size(), sentinel) == 0)
+        throw std::runtime_error(result.substr(sentinel.size()));
+    return result;
+}
+
+// Parses an explicit boolean literal. Anything else is rejected rather than
+// read as false, so "True" or "yes" cannot silently clear a flag.
+inline bool ParseBoolLiteral(const std::string& value, bool& out) {
+    std::string lower = value;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    if (lower == "true" || lower == "1" || lower == "on" || lower == "yes") { out = true; return true; }
+    if (lower == "false" || lower == "0" || lower == "off" || lower == "no") { out = false; return true; }
+    return false;
 }
 
 // ── JSON escape utility ─────────────────────────────────────────
@@ -548,6 +917,28 @@ inline ClassDesc* FindClassDescByName(const std::string& className, SClass_ID su
     return found;
 }
 
+// Whole-string numbers only: std::stof and std::stoi read "12abc" as 12 and
+// throw on "abc"; a value that is not entirely a number is rejected instead.
+inline bool ParseWholeNumber(const std::string& text, float& out) {
+    try {
+        size_t used = 0;
+        out = std::stof(text, &used);
+        return text.find_first_not_of(" 	", used) == std::string::npos;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+inline bool ParseWholeNumber(const std::string& text, int& out) {
+    try {
+        size_t used = 0;
+        out = std::stoi(text, &used);
+        return text.find_first_not_of(" 	", used) == std::string::npos;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 // ── Parse a MAXScript-style value string into typed PB2 value ───
 // Returns true if the param was set successfully.
 inline bool SetPB2ParamFromString(IParamBlock2* pb, ParamID pid, ParamType2 ptype,
@@ -561,7 +952,8 @@ inline bool SetPB2ParamFromString(IParamBlock2* pb, ParamID pid, ParamType2 ptyp
     case TYPE_PCNT_FRAC:
     case TYPE_WORLD:
     case TYPE_COLOR_CHANNEL: {
-        float f = std::stof(valStr);
+        float f = 0.0f;
+        if (!ParseWholeNumber(valStr, f)) return false;
         return pb->SetValue(pid, t, f) != 0;
     }
     case TYPE_INT:
@@ -572,7 +964,8 @@ inline bool SetPB2ParamFromString(IParamBlock2* pb, ParamID pid, ParamType2 ptyp
         // Handle "true"/"false" for bools
         if (valStr == "true" || valStr == "on") return pb->SetValue(pid, t, 1) != 0;
         if (valStr == "false" || valStr == "off") return pb->SetValue(pid, t, 0) != 0;
-        int i = std::stoi(valStr);
+        int i = 0;
+        if (!ParseWholeNumber(valStr, i)) return false;
         return pb->SetValue(pid, t, i) != 0;
     }
     case TYPE_RGBA:

@@ -11,15 +11,15 @@ Connect AI agents to Autodesk 3ds Max through the [Model Context Protocol](https
 
 Automate everything!
 
-**Current release: 1.7.5** — see [CHANGELOG.md](docs/CHANGELOG.md).
+**Current release: 1.7.6** — see [CHANGELOG.md](docs/CHANGELOG.md).
 
 ## Features
 
-- **160 MCP tools** — For scene reads, modeling, materials, modifiers, controllers, viewport capture, procedural graphs, and plugin workflows.
+- **161 MCP tools** — For scene reads, modeling, materials, modifiers, controllers, viewport capture, procedural graphs, and plugin workflows.
 - **Native Bridge** — only 2023-2027 versions.
 - **Introspection** — discover arbitrary Max classes for all kinds of automation and scripting purposes. 
 - **Bundled agent skill** — There is a bundled maxscript documentation if you want to create your own tools.
-- **FStorm materials and lights** — `FStorm`/`FStormPBR` texture import, palette laydown and smart import; create and edit plane/disc/sphere lights and suns with native solar controls. See [support and validation](docs/FSTORM.md).
+- **FStorm materials and lights** — `FStorm`/`FStormPBR` texture import, palette laydown and smart import; create and edit plane/disc/sphere lights and suns with native solar controls.
 
 ## Requirements
 
@@ -115,7 +115,7 @@ Automate repetitive work with MAXScript, or build procedural geometry and modifi
 
 | Tool | Description |
 |------|-------------|
-| `get_bridge_status` | Ping the MCP bridge when diagnosing connection errors |
+| `get_bridge_status` | Bridge health: whether Max is responsive, busy or hung and what holds its main thread; answers while Max is hung |
 | `get_session_context` | Bundle bridge status, capabilities, scene summary, and selection in one call |
 | `get_plugin_capabilities` | Max version, renderers, installed plugins, and class counts |
 
@@ -157,7 +157,6 @@ Automate repetitive work with MAXScript, or build procedural geometry and modifi
 | `set_modifier_property` | Set a modifier parameter on one or many objects |
 | `collapse_modifier_stack` | Collapse the stack |
 | `make_modifier_unique` | De-instance a shared modifier |
-| `inspect_modifier_properties` | Compatibility alias for `inspect_properties(target="modifier")` |
 
 ### Modeling
 
@@ -185,7 +184,7 @@ Automate repetitive work with MAXScript, or build procedural geometry and modifi
 | `backup_material_library` | Save temporary/scratch material libraries to `.mat` files |
 | `get_material_slots` | Compact slot/property readback for a material |
 | `inspect_material_network` | Semantic material graph, wired slots, texture manifest, health checks |
-| `material_roles` | Texture sources per material slot, including shared maps, composites and submaterials; advisory filename mismatches and missing files |
+| `material_roles` | Texture sources per material slot, including shared maps, composites and submaterials; advisory filename mismatches and missing files; flags maps whose file path can't be read |
 | `replicate_material` | Preview/apply structure-preserving material clone and texture remap |
 | `assign_material` | Create a material and assign it to objects |
 | `set_material_property` | Set one property on an object's material |
@@ -196,7 +195,7 @@ Automate repetitive work with MAXScript, or build procedural geometry and modifi
 | `create_material_from_textures` | Build a fully wired PBR material from texture files |
 | `create_shell_material` | Wrap any render + export materials in Shell Material (dual pipeline) |
 | `write_osl_shader` | Write OSL to disk and compile an OSLMap |
-| `replace_material` | Swap one material for another on all users |
+| `replace_material` | Put a source material wherever a target is used, on objects and in sub-material slots; the source can come from a slot, the Material Editor or the material library |
 | `batch_replace_materials` | Batch material replacement |
 | `palette_laydown` | Fill Material Editor palette slots from a texture folder |
 | `smart_import` | Batch-import meshes from a folder with auto PBR assignment |
@@ -217,7 +216,7 @@ Automate repetitive work with MAXScript, or build procedural geometry and modifi
 | `watch_scene` | Live event watcher for interactive sessions |
 | `isolate_and_capture_selected` | Per-selection isolated viewport captures |
 | `main_thread` | Inspect or clean up callbacks and timers running on Max's main/UI thread |
-| `max_dialogs` | Read any dialog blocking Max (Win32 or Qt) and press a chosen button, even while a tool call waits on it |
+| `max_dialogs` | Read any dialog blocking Max (Win32 or Qt) and press a chosen button, even while a tool call waits on it, on Max's main thread |
 
 ### Plugins & introspection
 
@@ -230,8 +229,7 @@ Automate repetitive work with MAXScript, or build procedural geometry and modifi
 | `inspect_plugin_constructor` | Creation notes for a plugin class |
 | `inspect_plugin_instance` | SDK schema v2: live values, linked maps and guarded edit tokens |
 | `plugin_patch` | Atomic typed PB2 edits with readback and stale/shared/animation guards |
-| `get_plugin_manifest` | Structured manifest (classes, workflows, gotchas) |
-| `refresh_plugin_manifest` | Rebuild manifest from live runtime |
+| `get_plugin_manifest` | Structured manifest (classes, workflows, gotchas), rebuilt from the live runtime on each call |
 | `introspect_class` | SDK parameter descriptors and published interface metadata |
 | `introspect_instance` | Deep SDK introspection with live values |
 
@@ -349,15 +347,13 @@ and existing procedural skies use the provider's dome or environment binding.
 
 | Tool | Description |
 |------|-------------|
-| `list_tyflow_operator_types` | Available operator names for this install |
-| `create_tyflow` | Create tyFlow with events and operators |
-| `create_tyflow_preset` | Presets: rain, snow, fountain, burst, debris |
+| `create_tyflow` | Create tyFlow with an event and operators, or a preset: rain, snow, fountain, burst, debris |
 | `get_tyflow_info` | Deep flow/event/operator readback |
 | `harvest_tyflow_manifest` | Probe and cache the installed tyFlow operator surface by tyFlow version |
-| `list_tyflow_operators` | Query the cached tyFlow operator manifest without touching Max |
+| `list_tyflow_operators` | Query the cached manifest, including per-type availability, without touching Max |
 | `get_tyflow_graph` | Read events, operators, properties, ledger edges, and wiring staleness |
 | `tyflow_apply_patch` | Apply a batch of tyFlow graph operations as one verified transaction |
-| `connect_tyflow_operator` | Connect or retarget a test/Send Out operator to an event |
+| `connect_tyflow_operator` | Connect or retarget a test/Send Out operator to an event, optionally creating the Send Out |
 | `disconnect_tyflow_operator` | Disconnect an operator output and remove its ledger edge |
 | `set_tyflow_wiring_ledger` | Reconcile recorded graph wiring after external or visual edits |
 | `tyflow_event_census` | Count particles per event at probe frames with temporary instrumentation |
@@ -367,7 +363,6 @@ and existing procedural skies use the provider's dome or environment binding.
 | `set_tyflow_physx` | Object-level PhysX settings |
 | `add_tyflow_collision` | Collision operator + collider list |
 | `add_tyflow_event` | Add an event |
-| `connect_tyflow_events` | Wire Send Out destinations |
 | `remove_tyflow_element` | Remove operator or event |
 | `get_tyflow_particle_count` | Particle count at a frame |
 | `get_tyflow_particles` | Particle data rows |
@@ -393,9 +388,10 @@ and existing procedural skies use the provider's dome or environment binding.
 
 | Tool | Description |
 |------|-------------|
-| `execute_maxscript` | Run MAXScript when no dedicated tool exists (respects safe mode) |
+| `execute_maxscript` | Run MAXScript when no dedicated tool exists (respects safe mode); scripts that reset, open, fetch or quit keep the save prompt |
 | `execute_python` | Run Python with captured output, JSON results, tracebacks and undo rollback (requires safe mode off) |
 | `invoke_tool` | Call any registered tool from inside Max (testing) |
+| `capture_hang_diagnostics` | Capture native thread stacks of a hung Max from the OS, without contacting it |
 
 </details>
 

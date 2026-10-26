@@ -41,8 +41,9 @@ TOOLSET_SPECS = (
     ),
     ToolsetSpec(
         "connection",
-        "Bridge diagnostics, installed capabilities, session context, and main-thread checks.",
-        ("bridge", "capabilities", "session_context", "mainthread"),
+        "Bridge diagnostics, hung-Max stack capture, installed capabilities, session context, main-thread checks, "
+        "and native core reload.",
+        ("bridge", "diagnostics", "capabilities", "session_context", "mainthread", "core_reload"),
     ),
     ToolsetSpec(
         "scene",

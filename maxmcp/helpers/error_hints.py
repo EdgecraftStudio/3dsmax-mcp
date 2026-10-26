@@ -115,6 +115,33 @@ MAXSCRIPT_SUGGESTION_RULES: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] 
 
 # Message patterns applied to any tool error when no tool-authored hint exists.
 _MESSAGE_HINT_RULES: tuple[tuple[re.Pattern[str], ToolHint], ...] = (
+    # MAX_NOT_RESPONDING texts (max_client: "3ds Max (PID n) is not responding"). First:
+    # they can also mention "the bridge" or "main window not found".
+    (
+        re.compile(r"\b3ds Max \([^)]*\) is (still )?not responding\b", re.IGNORECASE),
+        {
+            "message": (
+                "3ds Max is hung. Wait up to ~10 min, re-checking with get_bridge_status: "
+                "some stalls (e.g. a V-Ray preview render) clear after several minutes, a deadlock never does. "
+                "capture_hang_diagnostics (OS-only, pauses each Max thread for milliseconds) "
+                "shows what blocks its main thread."
+            ),
+            "suggested_tools": ["capture_hang_diagnostics", "get_bridge_status"],
+        },
+    ),
+    # No bridge to connect to (max_client: "Named pipe ... not found"). Before the
+    # target rule: a missing pipe is not a missing scene object.
+    (
+        re.compile(r"\bnamed pipe\b.*\bnot found\b", re.IGNORECASE),
+        {
+            "message": (
+                "The 3ds Max bridge could not be reached: Max may not be running or still starting, or the "
+                "MCP bridge plugin is not loaded. list_max_instances shows the Max instances this server can "
+                "reach; start 3ds Max if none is listed, then retry."
+            ),
+            "suggested_tools": ["list_max_instances", "get_bridge_status"],
+        },
+    ),
     (
         re.compile(r"\bnot found\b|\bunknown (object|node|material)\b", re.IGNORECASE),
         {
@@ -131,6 +158,17 @@ _MESSAGE_HINT_RULES: tuple[tuple[re.Pattern[str], ToolHint], ...] = (
             "message": (
                 "Command blocked by safe mode. Do not retry the same call; "
                 "use a dedicated MCP tool or adjust safe_mode settings."
+            ),
+        },
+    ),
+    # A script exception that the bridge relayed. The transport worked, so this
+    # must win over the "bridge" rule below.
+    (
+        re.compile(r"__MCP_MS_ERR__|MAXScript error|-- \w+ error:", re.IGNORECASE),
+        {
+            "message": (
+                "MAXScript error inside 3ds Max; the bridge connection is fine. "
+                "Do not retry unchanged: read the error, then fix the arguments or script."
             ),
         },
     ),
@@ -277,7 +315,8 @@ def resolve_error_hint(
             if tool_name == "get_bridge_status" and "get_bridge_status" in hint.get(
                 "suggested_tools", []
             ):
-                return {"message": hint["message"]}
+                others = [t for t in hint["suggested_tools"] if t != "get_bridge_status"]
+                return {"message": hint["message"], **({"suggested_tools": others} if others else {})}
             return dict(hint)
 
     return None

@@ -170,6 +170,11 @@ def _raw_tool_decorator(raw_tool, decorator_args, decorator_kwargs, annotations:
     return raw_tool(*decorator_args, **decorator_kwargs)
 
 
+def _pid_guarded(fn) -> bool:
+    """Every tool takes expected_pid except the routing tools, which pick the target."""
+    return not fn.__module__.endswith(".routing")
+
+
 def _install_structured_tool_results() -> None:
     """Register MCP tools with stable JSON envelopes while keeping raw callables."""
     raw_tool = mcp.tool
@@ -188,6 +193,7 @@ def _install_structured_tool_results() -> None:
                 fn,
                 before_call=client.clear_last_response,
                 transport_provider=client.get_last_transport,
+                pid_guard=_pid_guarded(fn),
             )
             _register_raw_tool(registration_tool(fn), wrapped, annotations)
             return fn
@@ -204,6 +210,7 @@ def _install_structured_tool_results() -> None:
                 fn,
                 before_call=client.clear_last_response,
                 transport_provider=client.get_last_transport,
+                pid_guard=_pid_guarded(fn),
             )
             raw_decorator(wrapped)
             return fn
@@ -218,6 +225,7 @@ _install_structured_tool_results()
 CORE_TOOL_MODULES = (
     "execute",
     "bridge",
+    "diagnostics",
     "capabilities",
     "session_context",
     "query_scene",
@@ -283,6 +291,7 @@ SPECIALTY_TOOL_MODULES = (
     "tyflow_manifest",
     "tyflow_census",
     "wire_params",
+    "core_reload",  # Development: native core hot reload; full/progressive only.
 )
 
 
@@ -416,7 +425,24 @@ def max_assistant() -> str:
 
 
 def main():
+    from .parent_watchdog import start_parent_watchdog
+
+    start_parent_watchdog()
     mcp.run(transport="stdio")
+    # Client closed stdin: exit even if non-daemon threads linger, but never
+    # while a diagnostics capture holds a Max thread suspended.
+    try:
+        from .suspend_guard import release_all
+
+        release_all()
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                if stream is not None:
+                    stream.flush()
+            except Exception:
+                pass
+    finally:
+        os._exit(0)
 
 
 if __name__ == "__main__":

@@ -1,13 +1,14 @@
 #include "mcp_bridge/command_dispatcher.h"
-#include "mcp_bridge/bridge_gup.h"
+#include "mcp_bridge/core_bridge.h"
 #include "mcp_bridge/native_handlers.h"
-#include "mcp_bridge/main_thread_executor.h"
 #include "mcp_bridge/handler_helpers.h"
+#include "mcp_bridge/quiet_policy.h"
+#include "mcp_bridge/response_envelope.h"
 #include "mcp_bridge/transaction_policy.h"
-#include "mcp_bridge/dialog_watch.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <chrono>
+#include <initializer_list>
 #include <optional>
 #include <unordered_set>
 #include <shlobj.h>
@@ -27,23 +28,9 @@ using json = nlohmann::json;
 static bool g_safeMode = true;
 static bool g_safeModeLoaded = false;
 
-static bool LoadSafeModeSetting() {
-    char localAppData[MAX_PATH];
-    if (FAILED(SHGetFolderPathA(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, localAppData)))
-        return true;  // default: safe
-
-    std::string iniPath = std::string(localAppData) + "\\3dsmax-mcp\\mcp_config.ini";
-
-    char buf[16] = {};
-    GetPrivateProfileStringA("mcp", "safe_mode", "true", buf, 16, iniPath.c_str());
-
-    std::string val(buf);
-    return !(val == "false" || val == "0" || val == "off");
-}
-
 static bool IsSafeModeEnabled() {
     if (!g_safeModeLoaded) {
-        g_safeMode = LoadSafeModeSetting();
+        g_safeMode = McpEnvelope::ReadSafeModeSetting();
         g_safeModeLoaded = true;
     }
     return g_safeMode;
@@ -54,10 +41,17 @@ static bool IsSafeModeEnabled() {
 // skipping the main-thread PostMessage roundtrip. ~25 handlers
 // benefit: scene reads, plugin introspection, reference walking.
 // Mutation handlers (create/delete/transform/assign) and MAXScript
-// execution always marshal to the main thread.
+// execution always marshal to the main thread, including reads that run
+// any MAXScript (introspect_instance, get_wired_params, state sets).
+// The MAXScript paths themselves (RunMAXScript, EvaluateMAXScript,
+// HandleMaxScript, the PB1 modifier reads of inspect_properties) reach the
+// main thread through McpHost::RunOnMainThread: script reached from a direct
+// handler waits for the main thread instead of running on this one.
+// ping and native:max_dialogs never reach the core: the shell answers them
+// (core_control.cpp). watch_scene's reads run direct; the handler marshals its
+// start and stop, which register with Max, to the main thread itself.
 static bool IsDirectHandler(const std::string& cmd_type) {
     static const std::unordered_set<std::string> kDirect = {
-        "native:max_dialogs",
         // Scene reads
         "native:scene_info",
         "native:selection",
@@ -85,7 +79,6 @@ static bool IsDirectHandler(const std::string& cmd_type) {
         "native:list_plugin_classes",
         "native:discover_classes",
         "native:introspect_class",
-        "native:introspect_instance",
         // Controller reads
         "native:inspect_track_view",
         "native:list_wireable_params",
@@ -96,11 +89,6 @@ static bool IsDirectHandler(const std::string& cmd_type) {
         "native:watch_scene",
         // Effects (read-only)
         "native:get_effects",
-        // Wire params (read-only)
-        "native:get_wired_params",
-        // State sets (read-only)
-        "native:get_state_sets",
-        "native:get_camera_sequence",
         // System discovery (read-only)
         "native:list_macroscripts",
         "native:list_action_tables",
@@ -158,6 +146,7 @@ static bool IsMutatingNativeHandler(const std::string& cmd_type) {
         "native:scene_patch",
         "native:plugin_patch",
         "native:scene_qa_fix",
+        "native:mesh_script",
     };
     return kMutating.count(cmd_type) > 0;
 }
@@ -193,46 +182,9 @@ static bool ResultLooksLikeError(const std::string& result) {
     return status == "error" || status == "failed";
 }
 
-static std::string NativeErrorCodeForMessage(const std::string& message) {
-    std::string lower = message;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-    if (lower.find("user_busy") != std::string::npos) return "USER_BUSY";
-    if (lower.find("stale_view") != std::string::npos) return "STALE_VIEW";
-    if (lower.find("safe mode") != std::string::npos) return "SAFE_MODE";
-    if (lower.find("main thread execution timed out") != std::string::npos ||
-        lower.find("named pipe") != std::string::npos ||
-        (lower.find("bridge") != std::string::npos && lower.find("not found") != std::string::npos))
-        return "BRIDGE_DOWN";
-    if (lower.find("render busy") != std::string::npos ||
-        lower.find("already rendering") != std::string::npos)
-        return "RENDER_BUSY";
-    if (lower.find("ambiguous") != std::string::npos) return "AMBIGUOUS";
-    if (lower.find("unknown object class") != std::string::npos ||
-        lower.find("unknown modifier class") != std::string::npos ||
-        lower.find("unknown material class") != std::string::npos ||
-        lower.find("unknown class") != std::string::npos ||
-        (lower.find("plugin") != std::string::npos && lower.find("missing") != std::string::npos))
-        return "PLUGIN_MISSING";
-    if (lower.find("not found") != std::string::npos ||
-        lower.find("no material assigned") != std::string::npos ||
-        lower.find("no modifiers on") != std::string::npos)
-        return "NOT_FOUND";
-    return "BAD_PARAM";
-}
-
+// Shared with the shell's own answers (response_envelope.h).
 static std::string NormalizeNativeError(const std::string& message) {
-    json structured = json::parse(message, nullptr, false);
-    if (!structured.is_discarded() && structured.is_object() &&
-        (structured.contains("code") || structured.contains("message"))) {
-        return structured.dump();
-    }
-    const std::string code = NativeErrorCodeForMessage(message);
-    json payload;
-    payload["type"] = "NativeError";
-    payload["message"] = message;
-    payload["code"] = code;
-    payload["retryable"] = (code == "BRIDGE_DOWN" || code == "RENDER_BUSY" || code == "USER_BUSY");
-    return payload.dump();
+    return McpEnvelope::NormalizeError(message);
 }
 
 class NativeUndoTransaction {
@@ -278,14 +230,18 @@ private:
     MSTR label_;
 };
 
-// RAII guard — enables direct mode on construction, disables on destruction
+// RAII guard — enables direct mode on construction and restores the previous
+// mode on destruction, so a nested Dispatch never clears its caller's mode.
 struct DirectModeGuard {
     bool active;
-    DirectModeGuard(bool enable) : active(enable) {
-        if (active) MainThreadExecutor::EnableDirectMode();
+    bool previous;
+    DirectModeGuard(bool enable) : active(enable), previous(HostExecutor::IsDirectMode()) {
+        if (active) HostExecutor::EnableDirectMode();
     }
     ~DirectModeGuard() {
-        if (active) MainThreadExecutor::DisableDirectMode();
+        if (!active) return;
+        if (previous) HostExecutor::EnableDirectMode();
+        else HostExecutor::DisableDirectMode();
     }
 };
 
@@ -306,6 +262,10 @@ static std::string WideToUtf8(const wchar_t* w) {
     return s;
 }
 
+// Set on the pipe thread while dispatching one request; BuildResponse reports
+// it so callers can see that a script ran with Max's quiet mode off.
+static thread_local std::string tl_quiet_override;
+
 // ── Build JSON response ─────────────────────────────────────────
 static std::string BuildResponse(
     bool success,
@@ -314,23 +274,16 @@ static std::string BuildResponse(
     const std::string& request_id,
     const std::string& cmd_type,
     int duration_ms) {
-
-    json resp;
-    resp["success"] = success;
-    resp["requestId"] = request_id;
-    resp["result"] = result;
-    resp["error"] = error;
-    resp["meta"] = {
-        {"protocolVersion", 2},
-        {"cmdType", cmd_type},
-        {"safeMode", IsSafeModeEnabled()},
-        {"durationMs", duration_ms},
-        {"transport", "namedpipe"},
-        {"threadMode", MainThreadExecutor::IsDirectMode() ? "direct" : "mainThread"}
-    };
-    // Every response reports dialogs blocking Max, whoever opened them.
-    json dialogs = DialogWatch::OpenDialogs();
-    if (!dialogs.empty()) resp["meta"]["openDialogs"] = std::move(dialogs);
+    // Same envelope as the shell's own answers (response_envelope.h).
+    const bool safe_mode = IsSafeModeEnabled();
+    const bool direct = HostExecutor::IsDirectMode();
+    std::string response = McpEnvelope::Build(success, result, error, request_id, cmd_type, duration_ms,
+                                              safe_mode, direct, McpHost::DialogWatch::OpenDialogs());
+    if (tl_quiet_override.empty()) return response;
+    // A script ran with Max's quiet mode off although the caller left quiet
+    // unset. Rare, so the envelope is reparsed only then.
+    json resp = json::parse(response);
+    resp["meta"]["quietOverride"] = tl_quiet_override;
     return resp.dump();
 }
 
@@ -354,22 +307,43 @@ static bool ContainsBlockedCommand(const std::string& cmd) {
     return false;
 }
 
+static void RejectBlockedScript(const std::string& script) {
+    if (IsSafeModeEnabled() && ContainsBlockedCommand(script)) {
+        throw std::runtime_error("Blocked by safe mode: command contains a restricted function. Set safe_mode=false in %LOCALAPPDATA%\\3dsmax-mcp\\mcp_config.ini to disable.");
+    }
+}
+
+// Native payloads that carry MAXScript get the maxscript route's screen. The
+// decoded strings are checked: JSON escapes can spell a blocked name.
+static void RejectBlockedPayloadScripts(const std::string& command, std::initializer_list<const char*> keys) {
+    if (!IsSafeModeEnabled()) return;
+    json payload = json::parse(command, nullptr, false);
+    if (!payload.is_object()) return;
+    for (const char* key : keys) {
+        auto it = payload.find(key);
+        if (it != payload.end() && it->type() == json::value_t::string)
+            RejectBlockedScript(it->get<std::string>());
+    }
+}
+
 // ── MAXScript handler ───────────────────────────────────────────
 static std::string HandleMaxScript(
     const std::string& command,
-    MCPBridgeGUP* gup,
     bool quiet) {
 
-    if (IsSafeModeEnabled() && ContainsBlockedCommand(command)) {
-        throw std::runtime_error("Blocked by safe mode: command contains a restricted function. Set safe_mode=false in %LOCALAPPDATA%\\3dsmax-mcp\\mcp_config.ini to disable.");
-    }
+    RejectBlockedScript(command);
 
-    return gup->GetExecutor().ExecuteSync([&command, quiet]() -> std::string {
+    // MAXScript runs on Max's main thread only, whatever the thread mode.
+    return McpHost::RunOnMainThread([&command, quiet]() -> std::string {
+        HandlerHelpers::RequireMaxScriptThread();
         // Quiet mode lets prompts take their defaults, as batch scripts expect.
-        // quiet=false leaves Max's mode alone so prompts reach the agent as
-        // blocking dialogs. quietErrors keeps errors textual either way.
+        // quiet=false forces quiet mode off for the script (restored after),
+        // even if a plugin or script left Max quiet, so prompts reach the
+        // agent as blocking dialogs. Only the main thread changes the
+        // process-wide flag; this lambda always runs there.
+        // quietErrors keeps errors textual either way.
         std::optional<TempQuietMode> quiet_mode;
-        if (quiet) quiet_mode.emplace(TRUE);
+        quiet_mode.emplace(quiet ? TRUE : FALSE);
         std::wstring wcmd = HandlerHelpers::WrapForErrorCapture(
             HandlerHelpers::Utf8ToWide(command));
 
@@ -389,12 +363,16 @@ static std::string HandleMaxScript(
         }
 
         if (!ok) {
-            // Parse-time errors fall through here; runtime errors are caught
-            // inside MAXScript and surface as a sentinel string in fpv below.
+            // Runtime errors are caught inside MAXScript and surface as a
+            // sentinel string in fpv below. FALSE means a parse error OR an
+            // abort try/catch cannot catch (quitMax, escape): classify it,
+            // with Max's own error text as the fallback detail.
             const std::string detail = fpv.type == TYPE_TSTR && fpv.tstr ? WideToUtf8(fpv.tstr->data()) : "";
-            throw std::runtime_error("MAXScript execution failed: " + detail);
+            std::string code;
+            std::string message = HandlerHelpers::MaxScriptFailureMessage(wcmd, &code, detail);
+            throw std::runtime_error(HandlerHelpers::StructuredErrorPayload(code, message));
         }
-        DialogWatch::ThrowIfDismissed();
+        McpHost::DialogWatch::ThrowIfDismissed();
 
         // Convert FPValue to string
         if (fpv.type == TYPE_STRING || fpv.type == TYPE_FILENAME) {
@@ -425,21 +403,6 @@ static std::string HandleMaxScript(
     });
 }
 
-// ── Ping handler ────────────────────────────────────────────────
-static std::string HandlePing(MCPBridgeGUP* gup) {
-    return gup->GetExecutor().ExecuteSync([]() -> std::string {
-        Interface* ip = GetCOREInterface();
-        json result;
-        result["pong"] = true;
-        result["server"] = "3dsmax-mcp-native";
-        result["protocolVersion"] = 2;
-        result["transport"] = "namedpipe";
-        DWORD v = Get3DSMAXVersion();
-        result["maxVersion"] = 1998 + (HIWORD(v) / 1000);
-        return result.dump();
-    });
-}
-
 // ── Dispatcher ──────────────────────────────────────────────────
 std::string CommandDispatcher::Dispatch(
     const std::string& json_request,
@@ -447,6 +410,7 @@ std::string CommandDispatcher::Dispatch(
     const std::string& client_session_id) {
 
     auto start = std::chrono::steady_clock::now();
+    tl_quiet_override.clear();  // set below only for this request's script
 
     // Parse request
     json req;
@@ -459,24 +423,25 @@ std::string CommandDispatcher::Dispatch(
     std::string command = req.value("command", "");
     std::string cmd_type = req.value("type", "maxscript");
     std::string request_id = req.value("requestId", "");
-    DialogWatch::RequestContext request_context(request_id, cmd_type);
+    // health and native:max_dialogs never reach the core: the shell answers
+    // them on the pipe thread, and labels every core request for health
+    // (core_control.cpp).
+    McpHost::DialogWatch::RequestContext request_context(request_id, cmd_type);
 
     // Route to handler — read-only handlers run directly on pipe thread
     // _forceMainThread flag allows benchmarking the same handler both ways
     bool forceMain = req.value("_forceMainThread", false);
-    bool direct = !forceMain && IsDirectHandler(cmd_type);
+    // A Dispatch nested on the main thread (invoke_tool, run_tool_smoke) is
+    // already where main-thread work runs: direct mode would only make it look
+    // like a pipe thread (no quiet mode, no compile check, threadMode "direct").
+    bool direct = !forceMain && IsDirectHandler(cmd_type) && !HostExecutor::IsMainThread();
     DirectModeGuard dmg(direct);
 
     try {
         auto invoke = [&]() -> std::string {
         std::string result;
 
-        if (cmd_type == "native:max_dialogs") {
-            // No ExecuteSync, SDK calls, undo hold, or blocked command's pipe.
-            result = DialogWatch::Control(command);
-        } else if (cmd_type == "ping") {
-            result = HandlePing(gup);
-        } else if (cmd_type == "native:plugin_inspect") {
+        if (cmd_type == "native:plugin_inspect") {
             result = NativeHandlers::PluginInspect(command, gup);
         } else if (cmd_type == "native:plugin_patch") {
             result = NativeHandlers::PluginPatch(command, gup);
@@ -486,7 +451,15 @@ std::string CommandDispatcher::Dispatch(
             if (command.empty()) {
                 throw std::runtime_error("Empty MAXScript command");
             }
-            result = HandleMaxScript(command, gup, req.value("quiet", true));
+            // Quiet mode unless the caller chose, or the script could prompt
+            // to save or discard the scene (quiet would answer for them).
+            int explicitQuiet = -1;
+            if (req.contains("quiet") && req["quiet"].is_boolean())
+                explicitQuiet = req["quiet"].get<bool>() ? 1 : 0;
+            bool overridden = false;
+            const bool quiet = QuietPolicy::ResolveQuiet(command, explicitQuiet, &overridden);
+            if (overridden) tl_quiet_override = "file_command";
+            result = HandleMaxScript(command, quiet);
         // Native handlers
         } else if (cmd_type == "native:scene_info") {
             result = NativeHandlers::SceneInfo(command, gup);
@@ -510,6 +483,11 @@ std::string CommandDispatcher::Dispatch(
             result = NativeHandlers::SceneQAScan(command, gup);
         } else if (cmd_type == "native:scene_qa_fix") {
             result = NativeHandlers::SceneQAFix(command, gup);
+        } else if (cmd_type == "native:mesh_script") {
+            RejectBlockedPayloadScripts(command, {"resolve", "script", "finish"});
+            result = NativeHandlers::MeshScript(command, gup);
+        } else if (cmd_type == "native:geometry_snapshot") {
+            result = NativeHandlers::GeometrySnapshot(command, gup);
         // Phase 1: Object operations
         } else if (cmd_type == "native:get_object_properties") {
             result = NativeHandlers::GetObjectProperties(command, gup);
@@ -728,7 +706,9 @@ std::string CommandDispatcher::Dispatch(
         std::string result;
         // scene_patch owns a strict hold so it can reject an already-open user
         // transaction and report rollback only after Cancel() has completed.
-        const bool handlerOwnsTransaction = cmd_type == "native:scene_patch" || cmd_type == "native:plugin_patch";
+        // mesh_script opens its labeled hold for edits only; reads open none.
+        const bool handlerOwnsTransaction = cmd_type == "native:scene_patch" ||
+            cmd_type == "native:plugin_patch" || cmd_type == "native:mesh_script";
         const bool transact =
             IsMutatingNativeHandler(cmd_type) &&
             !CommandDispatcher::Detail::RequestIsDryRunOrPreview(cmd_type, command) &&
@@ -739,7 +719,7 @@ std::string CommandDispatcher::Dispatch(
             result = gup->GetExecutor().ExecuteSync([&]() -> std::string {
                 NativeUndoTransaction tx(cmd_type);
                 std::string inner = invoke();
-                DialogWatch::ThrowIfDismissed();
+                McpHost::DialogWatch::ThrowIfDismissed();
                 if (ResultLooksLikeError(inner)) {
                     tx.Cancel();
                 } else {
