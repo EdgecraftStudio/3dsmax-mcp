@@ -92,6 +92,8 @@ static bool IsDirectHandler(const std::string& cmd_type) {
         // System discovery (read-only)
         "native:list_macroscripts",
         "native:list_action_tables",
+        // Reads only its own table, while the call it reports holds the main thread
+        "native:job_progress",
     };
     return kDirect.count(cmd_type) > 0;
 }
@@ -147,6 +149,7 @@ static bool IsMutatingNativeHandler(const std::string& cmd_type) {
         "native:plugin_patch",
         "native:scene_qa_fix",
         "native:mesh_script",
+        "native:tyflow_operator",
     };
     return kMutating.count(cmd_type) > 0;
 }
@@ -156,6 +159,12 @@ static bool RequestIsReadOnlyAction(const std::string& cmd_type, const std::stri
     // Reads must remain available while the user owns an undo hold.
     const bool organization = cmd_type == "native:manage_layers" ||
         cmd_type == "native:manage_groups" || cmd_type == "native:manage_selection_sets";
+    if (cmd_type == "native:tyflow_operator") {
+        json payload = json::parse(command, nullptr, false);
+        if (!payload.is_object()) return false;
+        const std::string function = payload.value("function", "");
+        return function.size() > 3 && _strnicmp(function.c_str(), "get", 3) == 0;
+    }
     if (!organization && cmd_type != "native:manage_scene" &&
         cmd_type != "native:keyframe_tracks") return false;
     json payload = json::parse(command, nullptr, false);
@@ -575,6 +584,8 @@ std::string CommandDispatcher::Dispatch(
             result = NativeHandlers::AgentViewportCommand(command, gup);
         } else if (cmd_type == "native:capture_multi_view") {
             result = NativeHandlers::CaptureMultiView(command, gup);
+        } else if (cmd_type == "native:job_progress") {
+            result = NativeHandlers::GetJobProgress(command, gup);
         } else if (cmd_type == "native:capture_viewport") {
             result = NativeHandlers::CaptureViewport(command, gup);
         } else if (cmd_type == "native:capture_screen") {
@@ -691,6 +702,11 @@ std::string CommandDispatcher::Dispatch(
             result = NativeHandlers::InvokeInterface(command, gup);
         } else if (cmd_type == "native:run_macroscript") {
             result = NativeHandlers::RunMacroscript(command, gup);
+        // tyFlow graph access
+        } else if (cmd_type == "native:tyflow_graph_stream") {
+            result = NativeHandlers::TyFlowGraphStream(command, gup);
+        } else if (cmd_type == "native:tyflow_operator") {
+            result = NativeHandlers::TyFlowOperator(command, gup);
         // Live tool smoke testing
         } else if (cmd_type == "native:invoke_tool") {
             result = NativeHandlers::InvokeTool(command, gup);

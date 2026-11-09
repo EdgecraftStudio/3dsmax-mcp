@@ -98,6 +98,9 @@ namespace NativeHandlers {
     std::string CaptureMultiViewMainThread(const std::string& params);
     std::string CaptureMultiView(const std::string& params, MCPBridgeGUP* gup);
     std::string CaptureViewport(const std::string& params, MCPBridgeGUP* gup);
+
+    // Progress a long call reported under its progress_key (job_progress.h).
+    std::string GetJobProgress(const std::string& params, MCPBridgeGUP* gup);
     std::string CaptureScreen(const std::string& params, MCPBridgeGUP* gup);
     std::string IsolateAndCaptureSelected(const std::string& params, MCPBridgeGUP* gup);
 
@@ -191,6 +194,10 @@ namespace NativeHandlers {
     // Direct execution (no MAXScript parsing)
     std::string InvokeInterface(const std::string& params, MCPBridgeGUP* gup);
     std::string RunMacroscript(const std::string& params, MCPBridgeGUP* gup);
+
+    // tyFlow graph access (tyflow_handlers.cpp)
+    std::string TyFlowGraphStream(const std::string& params, MCPBridgeGUP* gup);
+    std::string TyFlowOperator(const std::string& params, MCPBridgeGUP* gup);
 
     // Live tool smoke testing (in-Max production path)
     std::string InvokeTool(const std::string& params, MCPBridgeGUP* gup);

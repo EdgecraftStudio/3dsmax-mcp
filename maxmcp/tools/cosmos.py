@@ -13,13 +13,23 @@ def cosmos_search(
     limit: int = 10,
     offset: int = 0,
     renderer: Literal["current", "corona", "vray"] = "current",
+    thumbnails: bool = False,
+    image_path: str = "",
+    sizes: bool = False,
 ) -> dict:
     """Find compatible Cosmos assets for the selected Max instance.
-    Returns asset IDs, kinds, thumbnails, sizes and download states. Filter models,
+    Returns asset IDs, kinds, preview URLs, file sizes and download states. Filter models,
     materials or HDRIs with kind. Renderer defaults to the current scene renderer.
-    Use cosmos_download to cache an asset or cosmos_import to download and import it.
+    image_path (absolute .png/.jpg/.jpeg/.webp, instead of query) finds assets that look
+    like the image, best match first, e.g. a reference photo or a viewport capture.
+    sizes=true adds each model's bounding box: bbox_cm, size_cm and size_scene [x,y,z].
+    image_path and sizes need Cosmos Browser 2026.11.04 or newer.
+    thumbnails=true also saves one labeled contact sheet of the page and returns its
+    file path in contact_sheet; read that file to see the assets. Tile N is the asset
+    whose tile is N. Use cosmos_download to cache an asset or cosmos_import to import it.
     """
-    return impl.search(client, query, kind, downloaded, limit, offset, renderer)
+    return impl.search(client, query, kind, downloaded, limit, offset, renderer, thumbnails,
+                       image_path, sizes)
 
 
 @mcp.tool()

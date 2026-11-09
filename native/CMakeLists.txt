@@ -118,12 +118,14 @@ set(MCP_CORE_SOURCES
     src/handlers/scene_manage_handlers.cpp
     src/handlers/file_handlers.cpp
     src/handlers/viewport_handlers.cpp
+    src/handlers/job_handlers.cpp
     src/handlers/identify_handlers.cpp
     src/handlers/material_handlers.cpp
     src/handlers/material_network_handlers.cpp
     src/handlers/material_library_handlers.cpp
     src/handlers/controller_handlers.cpp
     src/handlers/keyframe_handlers.cpp
+    src/handlers/tyflow_handlers.cpp
     src/handlers/plugin_introspect_handlers.cpp
     src/plugin_access.cpp
     src/handlers/plugin_access_handlers.cpp
@@ -294,7 +296,7 @@ if(MCP_BUILD_TRANSACTION_POLICY_TESTS)
     add_test(NAME dialog_sweeper COMMAND dialog_sweeper_tests)
     # Max's exit: idle pipe clients and queued requests must not hold GUP::Stop.
     add_executable(shutdown_tests tests/shutdown_tests.cpp src/pipe_server.cpp
-        src/main_thread_executor.cpp src/dialog_watch.cpp)
+        src/main_thread_executor.cpp src/dialog_watch.cpp src/bridge_health.cpp)
     target_include_directories(shutdown_tests PRIVATE include third_party)
     target_compile_definitions(shutdown_tests PRIVATE NOMINMAX _UNICODE UNICODE)
     add_test(NAME shutdown COMMAND shutdown_tests)
@@ -349,7 +351,7 @@ endif()
 
 option(MCP_BUILD_AGENT_VIEWPORT_PROBE "Build optional live agent viewport SDK test harness" OFF)
 if(MCP_BUILD_AGENT_VIEWPORT_PROBE)
-    add_library(agent_viewport_probe SHARED tests/agent_viewport_probe.cpp src/agent_viewport.cpp src/spatial_snapshot.cpp src/scene_journal.cpp src/handlers/viewport_handlers.cpp src/gdiplus_runtime.cpp src/main_thread_executor.cpp src/dialog_watch.cpp
+    add_library(agent_viewport_probe SHARED tests/agent_viewport_probe.cpp src/agent_viewport.cpp src/spatial_snapshot.cpp src/scene_journal.cpp src/handlers/viewport_handlers.cpp src/handlers/job_handlers.cpp src/gdiplus_runtime.cpp src/main_thread_executor.cpp src/dialog_watch.cpp
         src/core_bridge.cpp src/core_host.cpp src/render_host.cpp src/undo_records.cpp)
     target_include_directories(agent_viewport_probe PRIVATE include third_party "${MAXSDK_PATH}/include")
     target_compile_definitions(agent_viewport_probe PRIVATE NOMINMAX _UNICODE UNICODE MAX_SDK_VERSION=${MAX_VERSION} MAX_SILENCE_DEPRECATED_MATRIX_BOOL_CTOR)

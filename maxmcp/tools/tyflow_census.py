@@ -138,10 +138,14 @@ if flow == undefined then (
     local chanProp = ""
     local valProp = ""
     local mainErr = ""
+    -- true until this call opens the editor: nothing to close before that.
+    local editorWasOpen = true
     local instrumented = 0
     try (
         if evNames.count == 0 do throw "Flow has no events"
         {"if evNames.count > 16 do throw \"groups method supports at most 16 events\"" if method_key == "groups" else ""}
+        -- tyFlow 2.101 adds operators only to the flow whose editor is open.
+        editorWasOpen = mcpTyEditorOpen flow
         for ei = 1 to evNames.count do (
             local ev = mcpTySubAnimByName bo evNames[ei]
             local realEv = undefined
@@ -157,6 +161,8 @@ if flow == undefined then (
                 {instrument_block}
             )
         )
+        mcpTyEditorRestore flow editorWasOpen
+        editorWasOpen = true
         try (flow.tyFlow.reset_simulation()) catch ()
         for f in #({frame_list}) do (
             try (flow.tyFlow.updateParticles f) catch ()
@@ -177,6 +183,8 @@ if flow == undefined then (
             format "SAMPLED|%|%|%|%\\n" (f as string) (take as string) (total as string) (unknown as string) to:out
         )
     ) catch (mainErr = (getCurrentException()) as string)
+    -- Close an editor this call opened, also when the instrumentation failed midway.
+    mcpTyEditorRestore flow editorWasOpen
     {cleanup_block}
     if mainErr != "" do format "MAINERR|%\\n" (mcpTyClean mainErr) to:out
     format "INSTRUMENTED|%|%\\n" (instrumented as string) (evNames.count as string) to:out
@@ -280,9 +288,10 @@ def capture_tyflow_editor(
 ) -> str:
     """Open the tyFlow editor and capture the screen for visual wire inspection.
 
-    Wiring of flows not built through MCP cannot be read structurally; this
-    capture plus the returned event rectangles (position/width per event) lets
-    an agent map wires visually and reconcile them via set_tyflow_wiring_ledger.
+    get_tyflow_graph reads wiring from the flow itself. With an older bridge
+    (wiring_source "ledger"), this capture plus the returned event rectangles
+    (position/width per event) lets an agent map wires visually and reconcile
+    them via set_tyflow_wiring_ledger.
     Fullscreen capture is disabled by default — pass enabled=true. The editor is
     left open afterwards.
     """
